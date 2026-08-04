@@ -1,0 +1,9 @@
+# Copy this file to .gh-api-examples.conf and replace the placeholder values.
+# Do not commit .gh-api-examples.conf.
+hostname='ghes.example.com'
+org='traffic-sim'
+repo='messy-repo'
+GITHUB_TOKEN='replace-with-a-ghes-token'
+GITHUB_API_BASE_URL="https://${hostname}/api/v3"
+github_api_version='2022-11-28'
+curl_custom_flags='--no-progress-meter --fail-with-body'
