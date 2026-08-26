@@ -34,16 +34,18 @@
 #   -v       Verbose: show every operation, not just summaries
 #
 # Operation mix (approximate realistic day distribution):
-#   git_clone        24% - most expensive GHES op; exercises spokes + babeld
-#   git_fetch        17% - continuous CI/CD-style fetches on a persistent clone
-#   git_push          8% - publish a small commit from a simulator worktree
-#   git_branch        7% - create, commit to, and push a new branch
-#   api_read         15% - list repos, list issues, search code
-#   api_commit        8% - create a file commit via the Contents API
+#   git_clone        18% - most expensive GHES op; exercises spokes + babeld
+#   git_fetch        12% - continuous CI/CD-style fetches on a persistent clone
+#   git_push          7% - publish a small commit from a simulator worktree
+#   git_branch        6% - create, commit to, and push a new branch
+#   api_read         11% - list repos, list issues, search code
+#   api_refs_read    12% - list/paginate/match refs via git/refs and git/ref
+#   api_tag_ref       8% - create a batch of tag refs, then delete about half
+#   api_commit        6% - create a file commit via the Contents API
 #   api_issue         5% - open a new issue with an optional PR link and assignee
 #   api_issue_comment 4% - add activity entries to an open simulator issue
 #   api_issue_close   2% - close a randomly selected simulator issue
-#   api_pr            5% - open a PR and add follow-up commits from mixed users
+#   api_pr            4% - open a PR and add follow-up commits from mixed users
 #   api_merge         2% - merge at most one open PR every 60 seconds
 #   api_fork_pr_merge 2% - push to a user fork, PR to upstream, then merge into main
 #   workflow_dispatch 1% - trigger an Actions workflow dispatch event
@@ -86,7 +88,7 @@ if (( PARALLELISM < 1 || PARALLELISM > 16 )); then
   echo "ERROR: -p must be between 1 and 16." >&2; exit 1
 fi
 
-OP_NAMES=(git_clone git_fetch git_push git_branch api_read api_commit api_issue api_issue_comment api_issue_close api_pr api_merge api_fork_pr_merge workflow_dispatch)
+OP_NAMES=(git_clone git_fetch git_push git_branch api_read api_refs_read api_tag_ref api_commit api_issue api_issue_comment api_issue_close api_pr api_merge api_fork_pr_merge workflow_dispatch)
 WEIGHT_NAMES=()
 WEIGHT_VALUES=()
 TRAFFIC_WEIGHT_TOTAL=0
@@ -294,16 +296,18 @@ add_weighted_op() {
   done
 }
 
-add_weighted_op git_clone 24
-add_weighted_op git_fetch 17
-add_weighted_op git_push 8
-add_weighted_op git_branch 7
-add_weighted_op api_read 15
-add_weighted_op api_commit 8
+add_weighted_op git_clone 18
+add_weighted_op git_fetch 12
+add_weighted_op git_push 7
+add_weighted_op git_branch 6
+add_weighted_op api_read 11
+add_weighted_op api_refs_read 12
+add_weighted_op api_tag_ref 8
+add_weighted_op api_commit 6
 add_weighted_op api_issue 5
 add_weighted_op api_issue_comment 4
 add_weighted_op api_issue_close 2
-add_weighted_op api_pr 5
+add_weighted_op api_pr 4
 add_weighted_op api_merge 2
 add_weighted_op api_fork_pr_merge 2
 add_weighted_op workflow_dispatch 1
@@ -978,6 +982,95 @@ op_workflow_dispatch() {
     -d "${payload}" > /dev/null
 }
 
+op_api_refs_read() {
+  local _worker_dir="$1" username="$2" token="$3"
+  local auth="Authorization: token ${token}"
+  local accept="Accept: application/vnd.github+json"
+  local apiver="X-GitHub-Api-Version: ${github_api_version:-2022-11-28}"
+  local refs_base="${GITHUB_API_BASE_URL}/repos/${org}/${repo}/git"
+
+  # Every variant lands on /repositories/:repository_id/git/refs/* internally.
+  # Reading a heavily tagged repo makes the ref store and pagination work.
+  local variant=$(( RANDOM % 6 ))
+  case $variant in
+    0)
+      curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
+        "${refs_base}/matching-refs/tags/?per_page=100" > /dev/null
+      ;;
+    1)
+      # Deep pagination across the tag namespace
+      local page=$(( 1 + RANDOM % 20 ))
+      curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
+        "${refs_base}/matching-refs/tags/?per_page=100&page=${page}" > /dev/null
+      ;;
+    2)
+      curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
+        "${refs_base}/matching-refs/heads/?per_page=100" > /dev/null
+      ;;
+    3)
+      # Prefix match against a nested tag namespace
+      local prefixes=(release/2026 build/ci- sim/nightly v1.)
+      local prefix="${prefixes[$(( RANDOM % ${#prefixes[@]} ))]}"
+      curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
+        "${refs_base}/matching-refs/tags/${prefix}?per_page=100" > /dev/null
+      ;;
+    4)
+      # Single ref lookup for a tag that may or may not exist
+      curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
+        "${refs_base}/ref/tags/build/ci-$(printf '%06d' $(( 1 + RANDOM % 2000 )))" > /dev/null
+      ;;
+    5)
+      curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
+        "${GITHUB_API_BASE_URL}/repos/${org}/${repo}/tags?per_page=100" > /dev/null
+      ;;
+  esac
+}
+
+op_api_tag_ref() {
+  local _worker_dir="$1" username="$2" token="$3"
+  local auth="Authorization: token ${token}"
+  local accept="Accept: application/vnd.github+json"
+  local apiver="X-GitHub-Api-Version: ${github_api_version:-2022-11-28}"
+  local refs_base="${GITHUB_API_BASE_URL}/repos/${org}/${repo}/git"
+  local safe_user="${username//[^a-zA-Z0-9_-]/-}"
+  local ts; ts=$(timestamp_ms)
+
+  # Target a random commit so tags do not all point at the same object.
+  local sha
+  sha=$(curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
+    "${GITHUB_API_BASE_URL}/repos/${org}/${repo}/commits?per_page=30" \
+    | jq -r '.[].sha' 2>/dev/null \
+    | awk -v seed="${RANDOM}" 'BEGIN{srand(seed)} {a[NR]=$0} END{if (NR>0) print a[int(rand()*NR)+1]}')
+  [[ -z "${sha}" || "${sha}" == "null" ]] && return 1
+
+  local created=0
+  local tag_count=$(( 3 + RANDOM % 8 ))
+  local created_tags=()
+  local i
+  for (( i=1; i<=tag_count; i++ )); do
+    local tag_name="sim/${safe_user}/${ts}-${RANDOM}-${i}"
+    local payload; payload=$(jq -cn --arg ref "refs/tags/${tag_name}" --arg sha "${sha}" \
+      '{"ref":$ref,"sha":$sha}')
+    if curl ${CURL_FLAGS} -X POST -H "${accept}" -H "${apiver}" -H "${auth}" \
+      "${refs_base}/refs" -d "${payload}" > /dev/null; then
+      created=$(( created + 1 ))
+      created_tags+=("${tag_name}")
+    fi
+  done
+  bump_counter_by api_tags_created "${created}"
+
+  # Delete roughly half of them so the ref store churns rather than only grows.
+  local tag
+  for tag in "${created_tags[@]}"; do
+    (( RANDOM % 2 == 0 )) || continue
+    curl ${CURL_FLAGS} -X DELETE -H "${accept}" -H "${apiver}" -H "${auth}" \
+      "${refs_base}/refs/tags/${tag}" > /dev/null || true
+    bump_counter api_tags_deleted
+  done
+
+  (( created > 0 )) || return 1
+}
+
 # ---------------------------------------------------------------------------
 # Worker loop
 # ---------------------------------------------------------------------------
@@ -1009,6 +1102,8 @@ worker() {
       git_push)          op_git_push         "${worker_dir}" "${username}" "${token}" || rc=$? ;;
       git_branch)        op_git_branch       "${worker_dir}" "${username}" "${token}" || rc=$? ;;
       api_read)          op_api_read         "${worker_dir}" "${username}" "${token}" || rc=$? ;;
+      api_refs_read)     op_api_refs_read    "${worker_dir}" "${username}" "${token}" || rc=$? ;;
+      api_tag_ref)       op_api_tag_ref      "${worker_dir}" "${username}" "${token}" || rc=$? ;;
       api_commit)        op_api_commit       "${worker_dir}" "${username}" "${token}" || rc=$? ;;
       api_issue)         op_api_issue        "${worker_dir}" "${username}" "${token}" || rc=$? ;;
       api_issue_comment) op_api_issue_comment "${worker_dir}" "${username}" "${token}" || rc=$? ;;
@@ -1108,6 +1203,8 @@ cleanup() {
   printf "    %-22s %d\n" "git_push_files" "$(read_counter git_push_files)"
   printf "    %-22s %d\n" "git_branch_files" "$(read_counter git_branch_files)"
   printf "    %-22s %d\n" "api_commits" "$(read_counter api_commit)"
+  printf "    %-22s %d\n" "tag_refs_created" "$(read_counter api_tags_created)"
+  printf "    %-22s %d\n" "tag_refs_deleted" "$(read_counter api_tags_deleted)"
   printf "    %-22s %d\n" "api_commit_files" "$(read_counter api_commit_files)"
   printf "    %-22s %d\n" "pr_activity_commits" "$(read_counter pr_activity_commits)"
   printf "    %-22s %d\n" "pr_cross_user_commits" "$(read_counter pr_cross_user_commits)"

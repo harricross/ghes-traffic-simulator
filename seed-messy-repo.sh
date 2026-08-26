@@ -20,16 +20,20 @@
 #   - Commit authors rotate through a pool of synthetic names so the author
 #     graph varies (audit log realism, author attribution overhead)
 #   - File renames, deletions, and re-adds: similarity detection on log/diff
-#   - Pushes all branches so GHES spokes must replicate the full graph
+#   - Bulk tags (default 2000): a large refs/tags/ namespace spread across the
+#     whole DAG, mixing lightweight and annotated tags in several nested
+#     namespaces so ref advertisement and git/refs API calls do real work
+#   - Pushes all branches and tags so GHES spokes must replicate the full graph
 #
 # Usage:
 #   ./seed-messy-repo.sh [-r <messy_repo_name>] [-c <commits>] [-b <branches>]
-#                        [-k <binary_kb>] [-v]
+#                        [-k <binary_kb>] [-t <tags>] [-v]
 #
 #   -r NAME  Name of the repo to create on GHES (default: "messy-repo")
 #   -c N     Commits on main branch (default: 200)
 #   -b N     Diverged branches to create (default: 25)
 #   -k N     Base binary blob size in KB -- actual sizes vary 0.5x-2x (default: 256)
+#   -t N     Tags to create across the whole history (default: 2000)
 #   -v       Verbose git output
 #
 # Requires: git, openssl
@@ -47,21 +51,23 @@ LINEAR_COMMITS=200
 BRANCHES=25
 COMMITS_PER_BRANCH=20
 BINARY_KB=256
+TAGS=2000
 VERBOSE=false
 CONF="./.gh-api-examples.conf"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
-while getopts "r:c:b:k:v" opt; do
+while getopts "r:c:b:k:t:v" opt; do
   case $opt in
     r) MESSY_REPO=$OPTARG ;;
     c) LINEAR_COMMITS=$OPTARG ;;
     b) BRANCHES=$OPTARG ;;
     k) BINARY_KB=$OPTARG ;;
+    t) TAGS=$OPTARG ;;
     v) VERBOSE=true ;;
     *)
-      echo "Usage: $0 [-r repo_name] [-c linear_commits] [-b branches] [-k binary_kb] [-v]" >&2
+      echo "Usage: $0 [-r repo_name] [-c linear_commits] [-b branches] [-k binary_kb] [-t tags] [-v]" >&2
       exit 1 ;;
   esac
 done
@@ -490,7 +496,55 @@ git commit ${GIT_FLAGS} -m "seed: create simulator feature branch" > /dev/null
 git checkout ${GIT_FLAGS} main
 
 # ---------------------------------------------------------------------------
-# Step 6: Push everything to GHES
+# Step 6: Bulk tags
+# Creates a large ref namespace so ref advertisement, ref listing, and the
+# /repositories/:id/git/refs/* endpoints all have real work to do.
+# ---------------------------------------------------------------------------
+if (( TAGS > 0 )); then
+  step "Creating ${TAGS} tags across the history"
+
+  # Candidate targets: every commit reachable from any ref, so tags scatter
+  # across main and all diverged branches rather than clustering on HEAD.
+  TAG_TARGETS=()
+  while IFS= read -r rev; do
+    TAG_TARGETS+=("${rev}")
+  done < <(git rev-list --all)
+  TARGET_COUNT=${#TAG_TARGETS[@]}
+
+  # Lightweight tags are batched through update-ref --stdin (one process for
+  # thousands of refs); annotated tags need real tag objects so they go
+  # through git tag -a individually.
+  LIGHT_REFS_FILE="$(mktemp)"
+
+  for (( t=1; t<=TAGS; t++ )); do
+    target="${TAG_TARGETS[$(( RANDOM % TARGET_COUNT ))]}"
+    tag_num=$(printf '%06d' "${t}")
+
+    # Mix of namespaces so refs/tags/ is wide and deep, not flat.
+    case $(( RANDOM % 4 )) in
+      0) tag_name="v1.${t}.0" ;;
+      1) tag_name="release/2026.${tag_num}" ;;
+      2) tag_name="build/ci-${tag_num}" ;;
+      3) tag_name="sim/nightly/${tag_num}" ;;
+    esac
+
+    if (( RANDOM % 3 == 0 )); then
+      git tag -f -a "${tag_name}" -m "sim annotated tag ${tag_num} r=${RANDOM}" "${target}"
+    else
+      printf 'update refs/tags/%s %s\n' "${tag_name}" "${target}" >> "${LIGHT_REFS_FILE}"
+    fi
+  done
+
+  if [[ -s "${LIGHT_REFS_FILE}" ]]; then
+    git update-ref --stdin < "${LIGHT_REFS_FILE}"
+  fi
+  rm -f "${LIGHT_REFS_FILE}"
+
+  ok "Created $(git tag | wc -l | tr -d ' ') tags"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 7: Push everything to GHES
 # ---------------------------------------------------------------------------
 step "Adding remote and pushing all refs"
 
@@ -503,9 +557,15 @@ git push ${GIT_FLAGS} --force origin main
 echo "  Pushing all branches..."
 git push ${GIT_FLAGS} --force origin --all
 
+if (( TAGS > 0 )); then
+  echo "  Pushing ${TAGS} tags..."
+  git push ${GIT_FLAGS} --force origin --tags
+fi
+
 # Summary statistics
 TOTAL_COMMITS=$(git rev-list --count HEAD)
 TOTAL_BRANCHES=$(git branch | wc -l | tr -d ' ')
+TOTAL_TAGS=$(git tag | wc -l | tr -d ' ')
 DISTINCT_AUTHORS=$(git log --format='%ae' --all | sort -u | wc -l | tr -d ' ')
 TOTAL_OBJECTS=$(git count-objects -v | awk '/^count/ {print $2}')
 PACK_SIZE_KB=$(git count-objects -v | awk '/^size-pack/ {print $2}')
@@ -518,6 +578,7 @@ echo "=========================================="
 printf "  Repo:              %s/%s\n" "${org}" "${MESSY_REPO}"
 printf "  Main commits:      %s\n"    "${TOTAL_COMMITS}"
 printf "  Branches:          %s\n"    "${TOTAL_BRANCHES}"
+printf "  Tags:              %s\n"    "${TOTAL_TAGS}"
 printf "  Merged back:       %d\n"    "${#MERGE_BRANCH_SHAS[@]}"
 printf "  Distinct authors:  %s\n"    "${DISTINCT_AUTHORS}"
 printf "  Total objects:     %s\n"    "${TOTAL_OBJECTS}"
