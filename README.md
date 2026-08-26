@@ -34,10 +34,13 @@ permissions, impersonation tokens, and `tmp/sim-users.json`:
 
 ```bash
 ./prepare-appliance-for-traffic-sim.sh -n 16
-./seed-messy-repo.sh -r messy-repo -c 200 -b 25 -k 256
+./seed-messy-repo.sh -r messy-repo -c 200 -b 25 -k 256 -t 2000
 ```
 
 Increase `-c`, `-b`, and `-k` to create a larger and more expensive repository.
+`-t` controls how many tags are created (default 2000), mixing lightweight and
+annotated tags across nested namespaces (`v1.*`, `release/*`, `build/ci-*`,
+`sim/nightly/*`) so `refs/tags/` is wide and ref lookups do real work.
 The generated token manifest is secret-bearing and is ignored by Git.
 
 ## Run traffic
@@ -68,6 +71,25 @@ remaining enabled operations:
 ```bash
 ./simulate-day-of-traffic.sh -u tmp/sim-users.json -p 8 -d 3600 \
   -x git_clone,git_fetch,git_push,git_branch
+```
+
+## Hammer the git refs endpoints
+
+Two operations drive `/repositories/:repository_id/git/refs/*` traffic:
+
+- `api_refs_read` lists, paginates, and prefix-matches refs, plus single-ref
+  lookups and the repository tags listing.
+- `api_tag_ref` creates a batch of tag refs against random commits, then
+  deletes roughly half of them so the ref store churns instead of only growing.
+
+To generate refs traffic almost exclusively, seed a heavily tagged repository
+and then weight the mix towards those two operations:
+
+```bash
+./seed-messy-repo.sh -r messy-repo -c 200 -b 25 -t 20000
+
+./simulate-day-of-traffic.sh -r messy-repo -u tmp/sim-users.json -p 16 -d 3600 \
+  -w 'api_refs_read=70,api_tag_ref=25,git_fetch=5'
 ```
 
 ## Import github.com repositories
