@@ -15,6 +15,12 @@ REST API activity, and import public or private repositories from github.com.
 The scripts are designed to work on macOS Bash 3.2 and avoid `mapfile`, `flock`,
 and platform-specific millisecond timestamp commands.
 
+The searchable sample corpus, including the Project Gutenberg text of *Pride
+and Prejudice*, is a Git submodule. Clone with
+`git clone --recurse-submodules`, or initialize it after cloning with
+`git submodule update --init --recursive`. The corpus repository is private, so
+you need access to `harricross/ghes-traffic-sim-testcontent`.
+
 ## Configure GHES
 
 ```bash
@@ -42,6 +48,21 @@ Increase `-c`, `-b`, and `-k` to create a larger and more expensive repository.
 annotated tags across nested namespaces (`v1.*`, `release/*`, `build/ci-*`,
 `sim/nightly/*`) so `refs/tags/` is wide and ref lookups do real work.
 The generated token manifest is secret-bearing and is ignored by Git.
+
+To add text-heavy, searchable content through the normal Git ingestion path,
+use `-T` to set the size of one synthetic text file added to each main-history
+commit:
+
+```bash
+./seed-messy-repo.sh -r search-corpus -c 500 -b 0 -t 0 -T 64
+```
+
+This adds 500 committed text files (about 32 MB total) under `searchable/`,
+one to each of the 500 main-history commits. Each file pulls varied samples
+from the synthetic records and book excerpts in `test-data/`, with stable
+document IDs such as `main-1`. `-T` accepts 0-1024 KB per file, with 0
+disabling the feature. The existing Git push sends these commits to GHES; the
+seeder does not write directly to GHES-managed Elasticsearch indices.
 
 ## Run traffic
 

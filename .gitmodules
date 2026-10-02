@@ -1,0 +1,4 @@
+[submodule "test-data"]
+	path = test-data
+	url = https://github.com/harricross/ghes-traffic-sim-testcontent.git
+	branch = main
