@@ -69,6 +69,21 @@ document IDs such as `main-1`. `-T` accepts 0-1024 KB per file, with 0
 disabling the feature. The existing Git push sends these commits to GHES; the
 seeder does not write directly to GHES-managed Elasticsearch indices.
 
+For a large corpus, use bulk mode to generate files concurrently and commit
+them in batches. Set `-c 0` to skip the randomized commit history, `-N` for the
+file count, `-P` for generator workers, and `-B` for files per commit:
+
+```bash
+./prepare-appliance-for-traffic-sim.sh -n 30 -r search-large
+./seed-messy-repo.sh -r search-large -c 0 -b 0 -k 1 -t 0 \
+  -T 1024 -N 8000 -P 4 -B 250
+```
+
+This generates 8,000 1 MiB files using four workers, then adds them in 32 Git
+commits before the normal push. Bulk mode still uses Git commits and does not
+write directly to Elasticsearch. As with the other seeder modes, it force-pushes
+the generated history, so use a new or disposable repository.
+
 ### Generate a standalone searchable sample
 
 `generate-searchable-text.py` creates one local UTF-8 text file from the sample
