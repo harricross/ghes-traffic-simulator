@@ -16,10 +16,12 @@
 #   7. Writes tmp/sim-users.json  <-- consumed by simulate-day-of-traffic.sh
 #
 # Usage:
-#   ./prepare-appliance-for-traffic-sim.sh [-n <num_users>] [-p <user_prefix>] [-v]
+#   ./prepare-appliance-for-traffic-sim.sh [-n <num_users>] [-p <user_prefix>]
+#                                          [-r <repo_name>] [-v]
 #
 #   -n N   Number of simulator users to create (default: 16, max: 50)
 #   -p S   Username prefix (default: "sim-user")
+#   -r S   Target repository (default: repo from .gh-api-examples.conf)
 #   -v     Verbose curl output (default: silent)
 #
 # After this script completes, run:
@@ -32,6 +34,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 NUM_USERS=16
 USER_PREFIX="sim-user"
+REPO_OVERRIDE=""
 VERBOSE=false
 CONF="./.gh-api-examples.conf"
 MANIFEST="tmp/sim-users.json"
@@ -39,12 +42,13 @@ MANIFEST="tmp/sim-users.json"
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
-while getopts "n:p:v" opt; do
+while getopts "n:p:r:v" opt; do
   case $opt in
     n) NUM_USERS=$OPTARG ;;
     p) USER_PREFIX=$OPTARG ;;
+    r) REPO_OVERRIDE=$OPTARG ;;
     v) VERBOSE=true ;;
-    *) echo "Usage: $0 [-n num_users] [-p user_prefix] [-v]" >&2; exit 1 ;;
+    *) echo "Usage: $0 [-n num_users] [-p user_prefix] [-r repo_name] [-v]" >&2; exit 1 ;;
   esac
 done
 
@@ -67,6 +71,10 @@ fi
 : "${repo:?repo not set in $CONF}"
 : "${GITHUB_TOKEN:?GITHUB_TOKEN not set in $CONF}"
 : "${GITHUB_API_BASE_URL:?GITHUB_API_BASE_URL not set in $CONF}"
+
+if [[ -n "${REPO_OVERRIDE}" ]]; then
+  repo="${REPO_OVERRIDE}"
+fi
 
 mkdir -p tmp
 
@@ -277,13 +285,18 @@ done
 # ---------------------------------------------------------------------------
 step "Adding sim users as push collaborators on '${org}/${repo}'"
 
+COLLAB_FAILURE_COUNT=0
 for username in "${CREATED_USERS[@]}"; do
-  result=$(curl ${CURL_FLAGS} -X PUT \
+  status=$(curl ${CURL_FLAGS} -X PUT \
     -H "${ADMIN_AUTH}" -H "${ACCEPT}" -H "${API_VER}" \
     "${GITHUB_API_BASE_URL}/repos/${org}/${repo}/collaborators/${username}" \
-    -d '{"permission":"push"}' 2>&1) || true
-  # 201 = added, 204 = already a collaborator; both are success
-  ok "${username} -> push collaborator"
+    -d '{"permission":"push"}' -o /dev/null -w "%{http_code}") || true
+  if [[ "${status}" == "201" || "${status}" == "204" ]]; then
+    ok "${username} -> push collaborator"
+  else
+    warn "Failed to add ${username} as push collaborator (HTTP ${status})"
+    COLLAB_FAILURE_COUNT=$(( COLLAB_FAILURE_COUNT + 1 ))
+  fi
 done
 
 # ---------------------------------------------------------------------------
@@ -334,6 +347,9 @@ ok "Wrote ${manifest_count} users to ${MANIFEST}"
 if (( ${#FAILED_USERS[@]} > 0 )); then
   warn "Token minting failed for: ${FAILED_USERS[*]}"
 fi
+if (( COLLAB_FAILURE_COUNT > 0 )); then
+  warn "Failed to grant push access to ${COLLAB_FAILURE_COUNT} simulator user(s) on ${org}/${repo}"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -357,3 +373,7 @@ echo "    -p  parallel workers (8-16 recommended)"
 echo "    -d  duration in seconds (3600 = 1 hour)"
 echo "    -j  max jitter seconds between ops (default 10)"
 echo "=========================================="
+
+if (( COLLAB_FAILURE_COUNT > 0 )); then
+  exit 1
+fi
