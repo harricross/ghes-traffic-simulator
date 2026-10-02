@@ -39,9 +39,14 @@ Preparation creates the organization, repository, simulator users, repository
 permissions, impersonation tokens, and `tmp/sim-users.json`:
 
 ```bash
-./prepare-appliance-for-traffic-sim.sh -n 16
-./seed-messy-repo.sh -r messy-repo -c 200 -b 25 -k 256 -t 2000
+./prepare-appliance-for-traffic-sim.sh -n 16 -r search-corpus
+./seed-messy-repo.sh -r search-corpus -c 200 -b 25 -k 256 -t 2000
 ```
+
+Use the same repository name for preparation and seeding. The preparation
+script grants simulator users push access to its target repository; when
+seeding an alternate repo with `-r`, pass that repo to preparation as well.
+The users manifest can be regenerated for existing simulator users.
 
 Increase `-c`, `-b`, and `-k` to create a larger and more expensive repository.
 `-t` controls how many tags are created (default 2000), mixing lightweight and

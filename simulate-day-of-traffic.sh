@@ -440,18 +440,19 @@ ensure_user_fork_ready() {
   local safe_user="${username//[^a-zA-Z0-9_-]/-}"
   local marker="${FORK_DIR}/${safe_user}.ready"
   local fork_api_url="${GITHUB_API_BASE_URL}/repos/${username}/${repo}"
+  local fork_create_status=""
   if [[ -f "${marker}" ]]; then
     return 0
   fi
 
   local status; status=$(api_status_code "${token}" "${fork_api_url}")
   if [[ "${status}" != "200" ]]; then
-    curl ${CURL_FLAGS} -X POST \
+    fork_create_status=$(curl ${CURL_FLAGS} -X POST \
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: ${github_api_version:-2022-11-28}" \
       -H "Authorization: token ${token}" \
       "${GITHUB_API_BASE_URL}/repos/${org}/${repo}/forks" \
-      -d '{}' > /dev/null || true
+      -d '{}' -o /dev/null -w "%{http_code}") || true
   fi
 
   local attempt
@@ -463,6 +464,7 @@ ensure_user_fork_ready() {
     fi
     sleep 2
   done
+  log INFO "Fork ${username}/${repo} is unavailable after creation attempt (HTTP ${fork_create_status:-$status}); check fork policy and user access"
   return 1
 }
 
@@ -1016,8 +1018,11 @@ op_api_refs_read() {
       ;;
     4)
       # Single ref lookup for a tag that may or may not exist
-      curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
-        "${refs_base}/ref/tags/build/ci-$(printf '%06d' $(( 1 + RANDOM % 2000 )))" > /dev/null
+      local status
+      status=$(curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
+        "${refs_base}/ref/tags/build/ci-$(printf '%06d' $(( 1 + RANDOM % 2000 )))" \
+        -o /dev/null -w "%{http_code}") || true
+      [[ "${status}" == "200" || "${status}" == "404" ]]
       ;;
     5)
       curl ${CURL_FLAGS} -H "${accept}" -H "${apiver}" -H "${auth}" \
@@ -1061,14 +1066,16 @@ op_api_tag_ref() {
 
   # Delete roughly half of them so the ref store churns rather than only grows.
   local tag
-  for tag in "${created_tags[@]}"; do
-    (( RANDOM % 2 == 0 )) || continue
-    curl ${CURL_FLAGS} -X DELETE -H "${accept}" -H "${apiver}" -H "${auth}" \
-      "${refs_base}/refs/tags/${tag}" > /dev/null || true
-    bump_counter api_tags_deleted
-  done
-
-  (( created > 0 )) || return 1
+  if (( created > 0 )); then
+    for tag in "${created_tags[@]}"; do
+      (( RANDOM % 2 == 0 )) || continue
+      curl ${CURL_FLAGS} -X DELETE -H "${accept}" -H "${apiver}" -H "${auth}" \
+        "${refs_base}/refs/tags/${tag}" > /dev/null || true
+      bump_counter api_tags_deleted
+    done
+  else
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
