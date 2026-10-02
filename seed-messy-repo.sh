@@ -27,14 +27,19 @@
 #
 # Usage:
 #   ./seed-messy-repo.sh [-r <messy_repo_name>] [-c <commits>] [-b <branches>]
-#                        [-k <binary_kb>] [-t <tags>] [-T <searchable_text_kb>] [-v]
+#                        [-k <binary_kb>] [-t <tags>] [-T <searchable_text_kb>]
+#                        [-N <searchable_files>] [-P <generator_workers>]
+#                        [-B <files_per_commit>] [-v]
 #
 #   -r NAME  Name of the repo to create on GHES (default: "messy-repo")
 #   -c N     Commits on main branch (default: 200)
 #   -b N     Diverged branches to create (default: 25)
 #   -k N     Base binary blob size in KB -- actual sizes vary 0.5x-2x (default: 256)
 #   -t N     Tags to create across the whole history (default: 2000)
-#   -T N     Add one synthetic searchable text file of N KB to each main commit (default: 0)
+#   -T N     Searchable text file size in KB (default: 0)
+#   -N N     Generate N searchable files in bulk mode (default: disabled)
+#   -P N     Parallel searchable-content generators in bulk mode (default: 4, max: 16)
+#   -B N     Searchable files per Git commit in bulk mode (default: 250)
 #   -v       Verbose git output
 #
 # Requires: git, openssl, python3
@@ -54,6 +59,9 @@ COMMITS_PER_BRANCH=20
 BINARY_KB=256
 TAGS=2000
 SEARCHABLE_TEXT_KB=0
+SEARCHABLE_FILE_COUNT=0
+SEARCHABLE_WORKERS=4
+SEARCHABLE_BATCH_SIZE=250
 VERBOSE=false
 CONF="./.gh-api-examples.conf"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,7 +69,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
-while getopts "r:c:b:k:t:T:v" opt; do
+while getopts "r:c:b:k:t:T:N:P:B:v" opt; do
   case $opt in
     r) MESSY_REPO=$OPTARG ;;
     c) LINEAR_COMMITS=$OPTARG ;;
@@ -69,9 +77,12 @@ while getopts "r:c:b:k:t:T:v" opt; do
     k) BINARY_KB=$OPTARG ;;
     t) TAGS=$OPTARG ;;
     T) SEARCHABLE_TEXT_KB=$OPTARG ;;
+    N) SEARCHABLE_FILE_COUNT=$OPTARG ;;
+    P) SEARCHABLE_WORKERS=$OPTARG ;;
+    B) SEARCHABLE_BATCH_SIZE=$OPTARG ;;
     v) VERBOSE=true ;;
     *)
-      echo "Usage: $0 [-r repo_name] [-c linear_commits] [-b branches] [-k binary_kb] [-t tags] [-T searchable_text_kb] [-v]" >&2
+      echo "Usage: $0 [-r repo_name] [-c linear_commits] [-b branches] [-k binary_kb] [-t tags] [-T text_kb] [-N files] [-P workers] [-B files_per_commit] [-v]" >&2
       exit 1 ;;
   esac
 done
@@ -83,6 +94,41 @@ fi
 SEARCHABLE_TEXT_KB=$((10#${SEARCHABLE_TEXT_KB}))
 if (( SEARCHABLE_TEXT_KB > 1024 )); then
   echo "ERROR: -T must be between 0 and 1024 KB per searchable text file." >&2
+  exit 1
+fi
+if [[ ! "${SEARCHABLE_FILE_COUNT}" =~ ^[0-9]{1,5}$ ]]; then
+  echo "ERROR: -N must be between 0 and 20000 searchable files." >&2
+  exit 1
+fi
+SEARCHABLE_FILE_COUNT=$((10#${SEARCHABLE_FILE_COUNT}))
+if (( SEARCHABLE_FILE_COUNT > 20000 )); then
+  echo "ERROR: -N must be between 0 and 20000 searchable files." >&2
+  exit 1
+fi
+if [[ ! "${SEARCHABLE_WORKERS}" =~ ^[0-9]{1,2}$ ]]; then
+  echo "ERROR: -P must be between 1 and 16 workers." >&2
+  exit 1
+fi
+SEARCHABLE_WORKERS=$((10#${SEARCHABLE_WORKERS}))
+if (( SEARCHABLE_WORKERS < 1 || SEARCHABLE_WORKERS > 16 )); then
+  echo "ERROR: -P must be between 1 and 16 workers." >&2
+  exit 1
+fi
+if [[ ! "${SEARCHABLE_BATCH_SIZE}" =~ ^[0-9]{1,4}$ ]]; then
+  echo "ERROR: -B must be between 1 and 1000 files per commit." >&2
+  exit 1
+fi
+SEARCHABLE_BATCH_SIZE=$((10#${SEARCHABLE_BATCH_SIZE}))
+if (( SEARCHABLE_BATCH_SIZE < 1 || SEARCHABLE_BATCH_SIZE > 1000 )); then
+  echo "ERROR: -B must be between 1 and 1000 files per commit." >&2
+  exit 1
+fi
+if (( SEARCHABLE_FILE_COUNT > 0 && SEARCHABLE_TEXT_KB == 0 )); then
+  echo "ERROR: -N requires a nonzero -T file size." >&2
+  exit 1
+fi
+if (( SEARCHABLE_FILE_COUNT == 0 && SEARCHABLE_TEXT_KB > 0 && LINEAR_COMMITS == 0 )); then
+  echo "ERROR: -T requires at least one -c commit, or use -N for bulk mode." >&2
   exit 1
 fi
 
@@ -312,7 +358,7 @@ for (( i=1; i<=LINEAR_COMMITS; i++ )); do
 
   committed=false
 
-  if (( SEARCHABLE_TEXT_KB > 0 )); then
+  if (( SEARCHABLE_TEXT_KB > 0 && SEARCHABLE_FILE_COUNT == 0 )); then
     searchable_file="searchable/record-$(printf '%05d' "${i}").md"
     python3 "${SCRIPT_DIR}/generate-searchable-text.py" \
       "${searchable_file}" "${SEARCHABLE_TEXT_KB}" "main-${i}"
@@ -422,8 +468,64 @@ for (( i=1; i<=LINEAR_COMMITS; i++ )); do
 
 done
 
+if (( SEARCHABLE_FILE_COUNT > 0 )); then
+  step "Generating ${SEARCHABLE_FILE_COUNT} searchable files with ${SEARCHABLE_WORKERS} workers"
+  ACTIVE_WORKERS="${SEARCHABLE_WORKERS}"
+  if (( ACTIVE_WORKERS > SEARCHABLE_FILE_COUNT )); then
+    ACTIVE_WORKERS="${SEARCHABLE_FILE_COUNT}"
+  fi
+  BASE_FILES_PER_WORKER=$(( SEARCHABLE_FILE_COUNT / ACTIVE_WORKERS ))
+  EXTRA_FILES=$(( SEARCHABLE_FILE_COUNT % ACTIVE_WORKERS ))
+  NEXT_FILE_INDEX=1
+  GENERATOR_PIDS=()
+
+  for (( worker=1; worker<=ACTIVE_WORKERS; worker++ )); do
+    worker_file_count="${BASE_FILES_PER_WORKER}"
+    if (( worker <= EXTRA_FILES )); then
+      worker_file_count=$(( worker_file_count + 1 ))
+    fi
+    python3 "${SCRIPT_DIR}/generate-searchable-text.py" \
+      --batch-count "${worker_file_count}" \
+      --start-index "${NEXT_FILE_INDEX}" \
+      --files-per-batch "${SEARCHABLE_BATCH_SIZE}" \
+      searchable "${SEARCHABLE_TEXT_KB}" "bulk" &
+    GENERATOR_PIDS+=("$!")
+    NEXT_FILE_INDEX=$(( NEXT_FILE_INDEX + worker_file_count ))
+  done
+
+  GENERATOR_FAILURE_COUNT=0
+  for generator_pid in "${GENERATOR_PIDS[@]}"; do
+    if ! wait "${generator_pid}"; then
+      warn "Searchable text generator process ${generator_pid} failed"
+      GENERATOR_FAILURE_COUNT=$(( GENERATOR_FAILURE_COUNT + 1 ))
+    fi
+  done
+  if (( GENERATOR_FAILURE_COUNT > 0 )); then
+    echo "ERROR: ${GENERATOR_FAILURE_COUNT} searchable text generator process(es) failed." >&2
+    exit 1
+  fi
+
+  BULK_BATCH_COUNT=$(( (SEARCHABLE_FILE_COUNT + SEARCHABLE_BATCH_SIZE - 1) / SEARCHABLE_BATCH_SIZE ))
+  step "Committing searchable files in ${BULK_BATCH_COUNT} batches"
+  for (( batch=1; batch<=BULK_BATCH_COUNT; batch++ )); do
+    batch_dir="searchable/batch-$(printf '%05d' "${batch}")"
+    batch_first=$(( (batch - 1) * SEARCHABLE_BATCH_SIZE + 1 ))
+    batch_file_count="${SEARCHABLE_BATCH_SIZE}"
+    if (( batch_first + batch_file_count - 1 > SEARCHABLE_FILE_COUNT )); then
+      batch_file_count=$(( SEARCHABLE_FILE_COUNT - batch_first + 1 ))
+    fi
+    git add "${batch_dir}"
+    set_random_author
+    git commit ${GIT_FLAGS} \
+      -m "search(batch-${batch}): add ${batch_file_count} searchable files" > /dev/null
+  done
+  ok "Generated ${SEARCHABLE_FILE_COUNT} searchable files using ${ACTIVE_WORKERS} workers"
+fi
+
 ok "Main history done: $(git rev-list --count HEAD) commits, $(git log --format='%ae' | sort -u | wc -l | tr -d ' ') distinct authors"
-if (( SEARCHABLE_TEXT_KB > 0 )); then
+if (( SEARCHABLE_FILE_COUNT > 0 )); then
+  ok "Added ${SEARCHABLE_FILE_COUNT} searchable files (~$(( SEARCHABLE_FILE_COUNT * SEARCHABLE_TEXT_KB ))KB total) in ${BULK_BATCH_COUNT} commits"
+elif (( SEARCHABLE_TEXT_KB > 0 )); then
   ok "Added ${LINEAR_COMMITS} searchable text files to main commits (~$(( LINEAR_COMMITS * SEARCHABLE_TEXT_KB ))KB total)"
 fi
 
