@@ -27,16 +27,17 @@
 #
 # Usage:
 #   ./seed-messy-repo.sh [-r <messy_repo_name>] [-c <commits>] [-b <branches>]
-#                        [-k <binary_kb>] [-t <tags>] [-v]
+#                        [-k <binary_kb>] [-t <tags>] [-T <searchable_text_kb>] [-v]
 #
 #   -r NAME  Name of the repo to create on GHES (default: "messy-repo")
 #   -c N     Commits on main branch (default: 200)
 #   -b N     Diverged branches to create (default: 25)
 #   -k N     Base binary blob size in KB -- actual sizes vary 0.5x-2x (default: 256)
 #   -t N     Tags to create across the whole history (default: 2000)
+#   -T N     Add one synthetic searchable text file of N KB to each main commit (default: 0)
 #   -v       Verbose git output
 #
-# Requires: git, openssl
+# Requires: git, openssl, python3
 #
 # After completion run the traffic simulator against this repo:
 #   ./simulate-day-of-traffic.sh -r messy-repo -u tmp/sim-users.json -p 8 -d 3600
@@ -52,25 +53,38 @@ BRANCHES=25
 COMMITS_PER_BRANCH=20
 BINARY_KB=256
 TAGS=2000
+SEARCHABLE_TEXT_KB=0
 VERBOSE=false
 CONF="./.gh-api-examples.conf"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
-while getopts "r:c:b:k:t:v" opt; do
+while getopts "r:c:b:k:t:T:v" opt; do
   case $opt in
     r) MESSY_REPO=$OPTARG ;;
     c) LINEAR_COMMITS=$OPTARG ;;
     b) BRANCHES=$OPTARG ;;
     k) BINARY_KB=$OPTARG ;;
     t) TAGS=$OPTARG ;;
+    T) SEARCHABLE_TEXT_KB=$OPTARG ;;
     v) VERBOSE=true ;;
     *)
-      echo "Usage: $0 [-r repo_name] [-c linear_commits] [-b branches] [-k binary_kb] [-t tags] [-v]" >&2
+      echo "Usage: $0 [-r repo_name] [-c linear_commits] [-b branches] [-k binary_kb] [-t tags] [-T searchable_text_kb] [-v]" >&2
       exit 1 ;;
   esac
 done
+
+if [[ ! "${SEARCHABLE_TEXT_KB}" =~ ^[0-9]{1,4}$ ]]; then
+  echo "ERROR: -T must be between 0 and 1024 KB per searchable text file." >&2
+  exit 1
+fi
+SEARCHABLE_TEXT_KB=$((10#${SEARCHABLE_TEXT_KB}))
+if (( SEARCHABLE_TEXT_KB > 1024 )); then
+  echo "ERROR: -T must be between 0 and 1024 KB per searchable text file." >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Load config
@@ -147,7 +161,7 @@ rand_blob_kb() {
 }
 
 # Append a random-sized chunk from war-and-peace (or fallback text).
-LOREM_FILE="test-data/war-and-peace.txt"
+LOREM_FILE="${SCRIPT_DIR}/test-data/books/pride-and-prejudice/pg1342.txt"
 LOREM_LINES=0
 LOREM_POS=1
 init_lorem() {
@@ -296,6 +310,13 @@ for (( i=1; i<=LINEAR_COMMITS; i++ )); do
 
   committed=false
 
+  if (( SEARCHABLE_TEXT_KB > 0 )); then
+    searchable_file="searchable/record-$(printf '%05d' "${i}").md"
+    python3 "${SCRIPT_DIR}/generate-searchable-text.py" \
+      "${searchable_file}" "${SEARCHABLE_TEXT_KB}" "main-${i}"
+    git add "${searchable_file}"
+  fi
+
   case "${op}" in
 
     text_binary)
@@ -396,9 +417,13 @@ for (( i=1; i<=LINEAR_COMMITS; i++ )); do
     git add text/history.txt
     git commit ${GIT_FLAGS} -m "fallback(${i}): text update" > /dev/null
   fi
+
 done
 
 ok "Main history done: $(git rev-list --count HEAD) commits, $(git log --format='%ae' | sort -u | wc -l | tr -d ' ') distinct authors"
+if (( SEARCHABLE_TEXT_KB > 0 )); then
+  ok "Added ${LINEAR_COMMITS} searchable text files to main commits (~$(( LINEAR_COMMITS * SEARCHABLE_TEXT_KB ))KB total)"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 4: Diverged branches with random fork points and varied content
