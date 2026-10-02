@@ -116,7 +116,7 @@ remaining enabled operations:
   -x git_clone,git_fetch,git_push,git_branch
 ```
 
-## Hammer the git refs endpoints
+## Add persistent tags or generate tag churn
 
 Two operations drive `/repositories/:repository_id/git/refs/*` traffic:
 
@@ -125,13 +125,31 @@ Two operations drive `/repositories/:repository_id/git/refs/*` traffic:
 - `api_tag_ref` creates a batch of tag refs against random commits, then
   deletes roughly half of them so the ref store churns instead of only growing.
 
-To generate refs traffic almost exclusively, seed a heavily tagged repository
-and then weight the mix towards those two operations:
+For an existing repository, use `seed-repo-tags.sh` to add permanent
+lightweight tags without cloning the repository or force-pushing its branches.
+It targets random commits from the latest 100 commits returned by GHES. The
+configured `GITHUB_TOKEN` must have write access:
 
 ```bash
-./seed-messy-repo.sh -r messy-repo -c 200 -b 25 -t 20000
+./seed-repo-tags.sh -r search-small -n 2000 -p load-test
+```
 
-./simulate-day-of-traffic.sh -r messy-repo -u tmp/sim-users.json -p 16 -d 3600 \
+Do not rerun `seed-messy-repo.sh -t` to add tags to an existing repository.
+That script builds a fresh history and force-pushes its refs.
+
+To create tag churn after adding the baseline refs, weight traffic towards
+`api_tag_ref`. Each operation creates 3-10 tags and deletes roughly half of
+those it created, so the tag set grows while the API and ref store are exercised:
+
+```bash
+./simulate-day-of-traffic.sh -r search-small -u tmp/sim-users.json -p 4 -d 300 \
+  -w 'api_tag_ref=100'
+```
+
+For mixed ref reads and tag churn:
+
+```bash
+./simulate-day-of-traffic.sh -r search-small -u tmp/sim-users.json -p 16 -d 3600 \
   -w 'api_refs_read=70,api_tag_ref=25,git_fetch=5'
 ```
 
