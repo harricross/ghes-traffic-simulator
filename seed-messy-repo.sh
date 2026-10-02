@@ -160,7 +160,7 @@ rand_blob_kb() {
   echo $(( (base / 32 + 1) * 32 ))
 }
 
-# Append a random-sized chunk from war-and-peace (or fallback text).
+# Append a random-sized chunk from the bundled prose sample (or fallback text).
 LOREM_FILE="${SCRIPT_DIR}/test-data/books/pride-and-prejudice/pg1342.txt"
 LOREM_LINES=0
 LOREM_POS=1
@@ -176,7 +176,9 @@ append_text() {
     local end=$(( LOREM_POS + chunk ))
     sed -n "${LOREM_POS},${end}p" "${LOREM_FILE}" >> "${target}"
     LOREM_POS=$(( end + 1 ))
-    (( LOREM_POS >= LOREM_LINES )) && LOREM_POS=1
+    if (( LOREM_POS >= LOREM_LINES )); then
+      LOREM_POS=1
+    fi
   else
     for _ in $(seq 1 "${chunk}"); do
       echo "ts=$(timestamp_ms) r=${RANDOM} filler line"

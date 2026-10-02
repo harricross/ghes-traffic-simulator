@@ -15,8 +15,8 @@ REST API activity, and import public or private repositories from github.com.
 The scripts are designed to work on macOS Bash 3.2 and avoid `mapfile`, `flock`,
 and platform-specific millisecond timestamp commands.
 
-The searchable sample corpus, including the Project Gutenberg text of *Pride
-and Prejudice*, is a Git submodule. Clone with
+The searchable sample corpus, including the Project Gutenberg texts of *Pride
+and Prejudice* and *Romeo and Juliet*, is a Git submodule. Clone with
 `git clone --recurse-submodules`, or initialize it after cloning with
 `git submodule update --init --recursive`. The corpus repository is private, so
 you need access to `harricross/ghes-traffic-sim-testcontent`.
@@ -63,6 +63,23 @@ from the synthetic records and book excerpts in `test-data/`, with stable
 document IDs such as `main-1`. `-T` accepts 0-1024 KB per file, with 0
 disabling the feature. The existing Git push sends these commits to GHES; the
 seeder does not write directly to GHES-managed Elasticsearch indices.
+
+### Generate a standalone searchable sample
+
+`generate-searchable-text.py` creates one local UTF-8 text file from the sample
+records and book excerpts in `test-data/`. It takes an output path, size in KB,
+and document ID:
+
+```bash
+python3 generate-searchable-text.py /tmp/sample.md 64 experiment-001
+```
+
+The size must be between 1 and 1024 KB. The document ID is included in each
+generated record and also seeds the sample selection, so using the same ID and
+corpus produces repeatable output. Use this script directly to inspect content
+or create a local fixture. It only writes the file; it does not commit, push, or
+index it. For GHES indexing and replication load, use `seed-messy-repo.sh -T`,
+which adds generated files to ordinary Git commits and pushes the repository.
 
 ## Run traffic
 
