@@ -7,3 +7,8 @@ GITHUB_TOKEN='replace-with-a-ghes-token'
 GITHUB_API_BASE_URL="https://${hostname}/api/v3"
 github_api_version='2022-11-28'
 curl_custom_flags='--no-progress-meter --fail-with-body'
+# Web session for seed-issue-attachments.py image uploads (GHES has no token
+# upload API). Prefer the GHES_WEB_* environment variables over storing these.
+# web_login='sim-user-001'
+# web_password='replace-with-the-web-password'
+# web_session_cookie='replace-with-the-user_session-cookie-value'

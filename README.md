@@ -168,6 +168,49 @@ For mixed ref reads and tag churn:
   -w 'api_refs_read=70,api_tag_ref=25,git_fetch=5'
 ```
 
+## Generate issue image attachments in object storage
+
+`seed-issue-attachments.py` creates issues and uploads generated PNG images to
+each one, so the appliance stores them as user assets in its object storage.
+Issue count, images per issue, and image size are configurable:
+
+```bash
+export GHES_WEB_LOGIN=sim-user-001
+read -rs GHES_WEB_PASSWORD && export GHES_WEB_PASSWORD
+./seed-issue-attachments.py -r search-corpus -n 500 -i 10 -s 512-2048 -p 8
+```
+
+- `-n` issues to create (1-100000, default 10)
+- `-i` images per issue (1-100, default 3)
+- `-s` image size in KB, either exact (`256`) or a random range per image
+  (`512-2048`), between 1 and 10240 KB (the GHES 10 MB image limit)
+- `-p` concurrent issue workers (1-32, default 4)
+- `-k` skip TLS verification, also enabled by `-k` in `curl_custom_flags`
+- `--dry-run` generate images and print totals without contacting GHES
+- `--save-dir DIR` also write every generated image locally
+
+GHES has no token-based attachment API, and `gh issue create --attach` refuses
+GHES hosts, so uploads use the browser upload flow with a web session. Set
+`GHES_WEB_LOGIN` and `GHES_WEB_PASSWORD` (built-in or LDAP authentication
+without two-factor), or set `GHES_WEB_SESSION` to the `user_session` cookie
+from a signed-in browser (required for SAML, CAS, or two-factor accounts). The
+web user needs write access to the repository. Issues are created through the
+REST API with the config's `GITHUB_TOKEN`. Each run writes a manifest of issue
+numbers and asset URLs to `tmp/issue-attachments-<run>.jsonl`.
+
+When GHES rate limiting is enabled, each user can create 100 upload policies
+per hour. The script retries `429` responses, but for large runs either disable
+rate limiting on a test appliance or split the run across several web users.
+
+Images are random RGB noise stored uncompressed, so every file is unique,
+incompressible, and exactly the requested size. Generate one locally with:
+
+```bash
+python3 generate-image.py /tmp/sample.png -s 1024        # exactly 1 MiB
+python3 generate-image.py /tmp/sample.png -s 100-500     # random 100-500 KB
+python3 generate-image.py /tmp/sample.png -d 1920x1080   # fixed dimensions
+```
+
 ## Import github.com repositories
 
 Import repositories into the configured GHES organization:
