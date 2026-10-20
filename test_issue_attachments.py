@@ -2,7 +2,7 @@ import importlib.util
 import json
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 spec = importlib.util.spec_from_file_location(
@@ -10,6 +10,24 @@ spec = importlib.util.spec_from_file_location(
 )
 seeder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(seeder)
+
+
+class WorkerArgumentTests(unittest.TestCase):
+    def test_supported_worker_counts(self):
+        for workers in (1, 32, 96, 128):
+            with self.subTest(workers=workers), patch("sys.argv", ["seeder", "-p", str(workers)]):
+                self.assertEqual(seeder.parse_args().workers, workers)
+
+    def test_invalid_worker_counts(self):
+        for workers in (0, 129):
+            with self.subTest(workers=workers), patch("sys.argv", ["seeder", "-p", str(workers)]):
+                with patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                    seeder.parse_args()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_default_worker_count(self):
+        with patch("sys.argv", ["seeder"]):
+            self.assertEqual(seeder.parse_args().workers, 4)
 
 
 class UploadImageTests(unittest.TestCase):

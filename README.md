@@ -184,7 +184,8 @@ read -rs GHES_WEB_PASSWORD && export GHES_WEB_PASSWORD
 - `-i` images per issue (1-100, default 3)
 - `-s` image size in KB, either exact (`256`) or a random range per image
   (`512-2048`), between 1 and 10240 KB (the GHES 10 MB image limit)
-- `-p` concurrent issue workers (1-32, default 4)
+- `-p` concurrent issue workers (1-128, default 4). Higher concurrency increases
+  client memory usage and appliance load; it does not bypass rate limits.
 - `-k` skip TLS verification, also enabled by `-k` in `curl_custom_flags`
 - `--dry-run` generate images and print totals without contacting GHES
 - `--save-dir DIR` also write every generated image locally

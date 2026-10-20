@@ -339,7 +339,7 @@ def parse_args():
     parser.add_argument("-i", "--images", type=int, default=3, help="images per issue, 1-100 (default: 3)")
     parser.add_argument("-s", "--size-kb", type=generate_image.parse_size_kb, default=generate_image.parse_size_kb("256"),
                         help="image size in KB, or MIN-MAX for a random size per image, 1-10240 (default: 256)")
-    parser.add_argument("-p", "--workers", type=int, default=4, help="concurrent issue workers, 1-32 (default: 4)")
+    parser.add_argument("-p", "--workers", type=int, default=4, help="concurrent issue workers, 1-128 (default: 4)")
     parser.add_argument("-t", "--title-prefix", default="Attachment load test", help="issue title prefix")
     parser.add_argument("-c", "--config", type=Path, default=DEFAULT_CONF, help="config file (default: ./.gh-api-examples.conf)")
     parser.add_argument("-k", "--insecure", action="store_true", help="skip TLS verification (also enabled by -k in curl_custom_flags)")
@@ -352,8 +352,8 @@ def parse_args():
         parser.error("-n must be between 1 and 100000")
     if not 1 <= args.images <= 100:
         parser.error("-i must be between 1 and 100")
-    if not 1 <= args.workers <= 32:
-        parser.error("-p must be between 1 and 32")
+    if not 1 <= args.workers <= 128:
+        parser.error("-p must be between 1 and 128")
     return args
 
 
