@@ -261,7 +261,7 @@ class Ghes:
             fields.append(("authenticity_token", policy["upload_authenticity_token"]))
         body, content_type = _encode_multipart(fields, ("file", name, "image/png", data))
         headers = {**web_headers, **(policy.get("header") or {}), "Content-Type": content_type}
-        self.with_retries("upload file", lambda: self.request("POST", upload_url, body, headers))
+        _, _, uploaded_raw = self.with_retries("upload file", lambda: self.request("POST", upload_url, body, headers))
 
         # Step 3: mark the asset uploaded when the storage backend requires it.
         if policy.get("asset_upload_url"):
@@ -272,7 +272,16 @@ class Ghes:
                 "PUT", asset_url, body, {**web_headers, "Content-Type": content_type}
             ))
 
-        return self._absolute(policy["asset"]["href"])
+        href = policy.get("asset", {}).get("href")
+        if not href:
+            try:
+                uploaded = json.loads(uploaded_raw)
+            except (ValueError, UnicodeDecodeError):
+                raise RuntimeError("upload succeeded but neither the policy nor the upload response provided an asset href") from None
+            href = uploaded.get("href") if isinstance(uploaded, dict) else None
+        if not isinstance(href, str) or not href:
+            raise RuntimeError("upload succeeded but neither the policy nor the upload response provided an asset href")
+        return self._absolute(href)
 
 
 class Stats:
