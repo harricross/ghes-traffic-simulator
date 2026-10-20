@@ -37,6 +37,13 @@ class UploadImageTests(unittest.TestCase):
         )
         self.assertEqual(upload(), "https://ghes.example/assets/example")
 
+    def test_null_policy_asset_uses_upload_response(self):
+        _, upload = self.upload(
+            {"upload_url": "/storage/upload", "asset": None},
+            b'{"href": "/assets/example"}',
+        )
+        self.assertEqual(upload(), "https://ghes.example/assets/example")
+
     def test_finalize_is_preserved(self):
         ghes, upload = self.upload(
             {"upload_url": "/storage/upload", "asset": {"href": "/assets/example"},

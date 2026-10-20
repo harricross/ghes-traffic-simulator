@@ -272,7 +272,8 @@ class Ghes:
                 "PUT", asset_url, body, {**web_headers, "Content-Type": content_type}
             ))
 
-        href = policy.get("asset", {}).get("href")
+        asset = policy.get("asset")
+        href = asset.get("href") if isinstance(asset, dict) else None
         if not href:
             try:
                 uploaded = json.loads(uploaded_raw)
