@@ -205,6 +205,8 @@ from a signed-in browser (required for SAML, CAS, or two-factor accounts). The
 web user needs write access to the repository. Issues are created through the
 REST API with the config's `GITHUB_TOKEN`. Each run writes a manifest of issue
 numbers and asset URLs to `tmp/issue-attachments-<run>.jsonl`.
+The uploader accepts the asset URL from either the upload policy or the
+completed upload response, accommodating both GHES upload response formats.
 
 When GHES rate limiting is enabled, each user can create 100 upload policies
 per hour. The script retries `429` responses, but for large runs either disable
