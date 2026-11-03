@@ -76,7 +76,9 @@ if [[ -n "${REPO_OVERRIDE}" ]]; then
   repo="${REPO_OVERRIDE}"
 fi
 
+umask 077
 mkdir -p tmp
+chmod 700 tmp
 
 # Determine git hostname (strip /api/v3 path context - hostname var is host only)
 GIT_HOSTNAME="${hostname}"
@@ -91,10 +93,16 @@ else
   CURL_FLAGS="${CURL_FLAGS} --silent --show-error"
 fi
 
-# Admin auth header
-ADMIN_AUTH="Authorization: token ${GITHUB_TOKEN}"
 ACCEPT="Accept: application/vnd.github+json"
 API_VER="X-GitHub-Api-Version: ${github_api_version:-2022-11-28}"
+
+curl_admin() {
+  # Read the credential from stdin rather than exposing it in curl's arguments.
+  # Never enable verbose output for authenticated requests: curl would print
+  # the Authorization header.
+  printf 'Authorization: token %s\n' "${GITHUB_TOKEN}" |
+    curl ${CURL_FLAGS} --no-verbose -H @- "$@"
+}
 
 timestamp_ms() {
   python3 -c 'import time; print(time.time_ns() // 1000000)'
@@ -109,8 +117,8 @@ skip() { echo "    SKIP: $*"; }
 warn() { echo "    WARN: $*"; }
 
 http_status() {
-  curl ${CURL_FLAGS} -o /dev/null -w "%{http_code}" \
-    -H "${ADMIN_AUTH}" -H "${ACCEPT}" "$1" || echo "000"
+  curl_admin -o /dev/null -w "%{http_code}" \
+    -H "${ACCEPT}" "$1" || echo "000"
 }
 
 # ---------------------------------------------------------------------------
@@ -130,8 +138,8 @@ for (( i=1; i<=NUM_USERS; i++ )); do
   else
     payload=$(jq -cn --arg l "${username}" --arg e "${email}" \
       '{"login":$l,"email":$e}')
-    result=$(curl ${CURL_FLAGS} -X POST \
-      -H "${ADMIN_AUTH}" -H "${ACCEPT}" -H "${API_VER}" \
+    result=$(curl_admin -X POST \
+      -H "${ACCEPT}" -H "${API_VER}" \
       -H "Content-Type: application/json" \
       "${GITHUB_API_BASE_URL}/admin/users" \
       -d "${payload}" 2>&1) || true
@@ -159,8 +167,8 @@ else
     --arg pn "${org}: Traffic Simulator Org" \
     --arg ad "${admin_user}" \
     '{"login":$nm,"profile_name":$pn,"admin":$ad}')
-  result=$(curl ${CURL_FLAGS} -X POST \
-    -H "${ADMIN_AUTH}" -H "${ACCEPT}" \
+  result=$(curl_admin -X POST \
+    -H "${ACCEPT}" \
     "${GITHUB_API_BASE_URL}/admin/organizations" \
     -d "${payload}" 2>&1) || true
   if echo "${result}" | jq -e '.url' > /dev/null 2>&1; then
@@ -183,8 +191,8 @@ else
     --arg nm "${repo}" \
     --arg desc "Traffic simulator target repo" \
     '{"name":$nm,"description":$desc,"private":false,"auto_init":true}')
-  result=$(curl ${CURL_FLAGS} -X POST \
-    -H "${ADMIN_AUTH}" -H "${ACCEPT}" -H "${API_VER}" \
+  result=$(curl_admin -X POST \
+    -H "${ACCEPT}" -H "${API_VER}" \
     "${GITHUB_API_BASE_URL}/orgs/${org}/repos" \
     -d "${payload}" 2>&1) || true
   if echo "${result}" | jq -e '.html_url' > /dev/null 2>&1; then
@@ -206,8 +214,8 @@ if [[ "${branch_status}" == "200" ]]; then
   skip "Branch '${FEATURE_BRANCH}' already exists"
 else
   # Get the SHA of the default branch HEAD
-  base_sha=$(curl ${CURL_FLAGS} \
-    -H "${ADMIN_AUTH}" -H "${ACCEPT}" \
+  base_sha=$(curl_admin \
+    -H "${ACCEPT}" \
     "${GITHUB_API_BASE_URL}/repos/${org}/${repo}/git/refs/heads/${BASE_BRANCH}" \
     | jq -r '.object.sha' 2>/dev/null || echo "")
 
@@ -218,8 +226,8 @@ else
       --arg ref "refs/heads/${FEATURE_BRANCH}" \
       --arg sha "${base_sha}" \
       '{"ref":$ref,"sha":$sha}')
-    result=$(curl ${CURL_FLAGS} -X POST \
-      -H "${ADMIN_AUTH}" -H "${ACCEPT}" \
+    result=$(curl_admin -X POST \
+      -H "${ACCEPT}" \
       "${GITHUB_API_BASE_URL}/repos/${org}/${repo}/git/refs" \
       -d "${payload}" 2>&1) || true
     if echo "${result}" | jq -e '.ref' > /dev/null 2>&1; then
@@ -237,8 +245,8 @@ for (( s=1; s<=SEED_COUNT; s++ )); do
   ts=$(timestamp_ms)
   content=$(echo "seed content ${s} timestamp ${ts}" | python3 base64encode.py)
   # Get current SHA of the file if it exists
-  existing_sha=$(curl ${CURL_FLAGS} \
-    -H "${ADMIN_AUTH}" -H "${ACCEPT}" \
+  existing_sha=$(curl_admin \
+    -H "${ACCEPT}" \
     "${GITHUB_API_BASE_URL}/repos/${org}/${repo}/contents/seed/file-${s}.txt" \
     | jq -r '.sha // empty' 2>/dev/null || echo "")
 
@@ -255,8 +263,8 @@ for (( s=1; s<=SEED_COUNT; s++ )); do
       '{"message":$msg,"content":$content}')
   fi
 
-  curl ${CURL_FLAGS} -X PUT \
-    -H "${ADMIN_AUTH}" -H "${ACCEPT}" \
+  curl_admin -X PUT \
+    -H "${ACCEPT}" \
     "${GITHUB_API_BASE_URL}/repos/${org}/${repo}/contents/seed/file-${s}.txt" \
     -d "${payload}" > /dev/null 2>&1 || warn "Seed commit ${s} failed (may already exist)"
 done
@@ -268,8 +276,8 @@ ok "Seed commits done"
 step "Adding sim users to org '${org}'"
 
 for username in "${CREATED_USERS[@]}"; do
-  result=$(curl ${CURL_FLAGS} -X PUT \
-    -H "${ADMIN_AUTH}" -H "${ACCEPT}" \
+  result=$(curl_admin -X PUT \
+    -H "${ACCEPT}" \
     "${GITHUB_API_BASE_URL}/orgs/${org}/memberships/${username}" \
     -d '{"role":"member"}' 2>&1) || true
   state=$(echo "${result}" | jq -r '.state // empty' 2>/dev/null || echo "")
@@ -287,8 +295,8 @@ step "Adding sim users as push collaborators on '${org}/${repo}'"
 
 COLLAB_FAILURE_COUNT=0
 for username in "${CREATED_USERS[@]}"; do
-  status=$(curl ${CURL_FLAGS} -X PUT \
-    -H "${ADMIN_AUTH}" -H "${ACCEPT}" -H "${API_VER}" \
+  status=$(curl_admin -X PUT \
+    -H "${ACCEPT}" -H "${API_VER}" \
     "${GITHUB_API_BASE_URL}/repos/${org}/${repo}/collaborators/${username}" \
     -d '{"permission":"push"}' -o /dev/null -w "%{http_code}") || true
   if [[ "${status}" == "201" || "${status}" == "204" ]]; then
@@ -309,8 +317,8 @@ JSON_ENTRIES=()
 FAILED_USERS=()
 
 for username in "${CREATED_USERS[@]}"; do
-  token_result=$(curl ${CURL_FLAGS} -X POST \
-    -H "${ADMIN_AUTH}" -H "${ACCEPT}" \
+  token_result=$(curl_admin -X POST \
+    -H "${ACCEPT}" \
     "${GITHUB_API_BASE_URL}/admin/users/${username}/authorizations" \
     -d '{"scopes":["repo","read:org"]}' 2>&1) || true
 
@@ -333,6 +341,8 @@ done
 # Step 7: Write the users manifest
 # ---------------------------------------------------------------------------
 step "Writing user manifest to ${MANIFEST}"
+touch "${MANIFEST}"
+chmod 600 "${MANIFEST}"
 
 # Join array entries with commas and wrap in []
 if (( ${#JSON_ENTRIES[@]} == 0 )); then
@@ -340,6 +350,7 @@ if (( ${#JSON_ENTRIES[@]} == 0 )); then
 else
   printf '%s\n' "${JSON_ENTRIES[@]}" | jq -s '.' > "${MANIFEST}"
 fi
+chmod 600 "${MANIFEST}"
 
 manifest_count=$(jq 'length' "${MANIFEST}")
 ok "Wrote ${manifest_count} users to ${MANIFEST}"
