@@ -123,6 +123,27 @@ ghes_push_url() {
   esac
 }
 
+curl_admin() {
+  # Read the credential from stdin rather than exposing it in curl's arguments.
+  # Never enable verbose output for authenticated requests: curl would print
+  # the Authorization header.
+  printf 'Authorization: token %s\n' "${GITHUB_TOKEN}" |
+    curl ${CURL_FLAGS} --no-verbose -H @- "$@"
+}
+
+dotcom_repo_metadata() {
+  local url="$1"
+  if [[ -n "${GITHUB_DOTCOM_TOKEN:-}" ]]; then
+    # Keep the optional token out of curl's arguments and verbose output.
+    printf 'Authorization: token %s\n' "${GITHUB_DOTCOM_TOKEN}" |
+      curl ${CURL_FLAGS} --no-verbose -H @- \
+        -H "Accept: application/vnd.github+json" "${url}"
+  else
+    curl ${CURL_FLAGS} --no-verbose \
+      -H "Accept: application/vnd.github+json" "${url}"
+  fi
+}
+
 read_specs=()
 for arg in "$@"; do
   read_specs+=("${arg}")
@@ -171,10 +192,17 @@ for entry in "${normalized_specs[@]}"; do
 
   step "Importing github.com/${src_owner}/${src_repo} -> ${TARGET_ORG}/${target_repo}"
 
-  repo_status=$(curl ${CURL_FLAGS} \
+  source_visibility=$(dotcom_repo_metadata \
+    "https://api.github.com/repos/${src_owner}/${src_repo}" |
+    jq -er 'if .private == true then "true" elif .private == false then "false" else error("missing repository visibility") end') || {
+    warn "Could not determine source repository visibility"
+    fail_count=$(( fail_count + 1 ))
+    continue
+  }
+
+  repo_status=$(curl_admin \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: ${github_api_version:-2022-11-28}" \
-    -H "Authorization: token ${GITHUB_TOKEN}" \
     "${GITHUB_API_BASE_URL}/repos/${TARGET_ORG}/${target_repo}" \
     -o /dev/null -w "%{http_code}" || echo "000")
 
@@ -184,11 +212,11 @@ for entry in "${normalized_specs[@]}"; do
     create_payload=$(jq -cn \
       --arg name "${target_repo}" \
       --arg desc "Imported from github.com/${src_owner}/${src_repo}" \
-      '{"name":$name,"description":$desc,"private":false,"auto_init":false}')
-    create_response=$(curl ${CURL_FLAGS} -X POST \
+      --argjson private "${source_visibility}" \
+      '{"name":$name,"description":$desc,"private":$private,"auto_init":false}')
+    create_response=$(curl_admin -X POST \
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: ${github_api_version:-2022-11-28}" \
-      -H "Authorization: token ${GITHUB_TOKEN}" \
       "${GITHUB_API_BASE_URL}/orgs/${TARGET_ORG}/repos" \
       -d "${create_payload}" 2>&1) || true
     if echo "${create_response}" | jq -e '.html_url // empty' > /dev/null 2>&1; then
