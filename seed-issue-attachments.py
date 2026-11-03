@@ -19,7 +19,12 @@ with GITHUB_TOKEN from the config.
 """
 
 import argparse
-import concurrent.futures
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
 import html
 import http.cookiejar
 import importlib.util
@@ -289,13 +294,17 @@ class Stats:
                 setattr(self, key, getattr(self, key) + value)
 
 
-def seed_issue(args, ghes, repo_id, run_id, index, stats, manifest):
+def seed_issue(args, ghes, repo_id, run_id, index, stats, manifest, generation_pool):
     rng = random.Random(f"{run_id}-{index}")
     images = []
     for image_index in range(1, args.images + 1):
         size = rng.randint(*args.size_kb)
         name = f"sim-{run_id}-{index:05d}-{image_index:03d}.png"
-        data = generate_image.generate_png(target_bytes=size, seed=f"{run_id}-{index}-{image_index}")
+        seed = f"{run_id}-{index}-{image_index}"
+        if generation_pool is None:
+            data = _generate_image(size, seed)
+        else:
+            data = generation_pool.submit(_generate_image, size, seed).result()
         if args.save_dir:
             (args.save_dir / name).write_bytes(data)
         href = None if args.dry_run else ghes.upload_image(args.org, args.repo, repo_id, name, data)
@@ -322,6 +331,60 @@ def seed_issue(args, ghes, repo_id, run_id, index, stats, manifest):
     return number, images
 
 
+def _generate_image(target_bytes, seed):
+    return generate_image.generate_png(target_bytes=target_bytes, seed=seed)
+
+
+def seed_issues(args, ghes, repo_id, run_id, stats, manifest, generation_pool):
+    with ThreadPoolExecutor(args.workers) as pool:
+        issue_indexes = iter(range(1, args.issues + 1))
+        futures = {}
+
+        def submit_next():
+            try:
+                index = next(issue_indexes)
+            except StopIteration:
+                return False
+            future = pool.submit(
+                seed_issue,
+                args,
+                ghes,
+                repo_id,
+                run_id,
+                index,
+                stats,
+                manifest,
+                generation_pool,
+            )
+            futures[future] = index
+            return True
+
+        for _ in range(min(args.issues, args.workers * 2)):
+            submit_next()
+
+        try:
+            while futures:
+                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index = futures.pop(future)
+                    try:
+                        number, images = future.result()
+                        label = f"#{number}" if number else f"(dry run {index})"
+                        print(
+                            f"    OK: issue {label}: {len(images)} image(s), "
+                            f"{sum(i['bytes'] for i in images)} bytes"
+                        )
+                    except Exception as err:  # noqa: BLE001 - report and keep seeding other issues
+                        stats.add(failures=1)
+                        print(f"    FAIL: issue {index}: {err}", file=sys.stderr)
+                    submit_next()
+        except KeyboardInterrupt:
+            print("Interrupted; waiting for in-flight uploads to finish", file=sys.stderr)
+            for future in futures:
+                future.cancel()
+            raise
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-r", "--repo", help="target repository (default: repo from the config)")
@@ -330,6 +393,11 @@ def parse_args():
     parser.add_argument("-s", "--size-kb", type=generate_image.parse_size_kb, default=generate_image.parse_size_kb("256"),
                         help="image size in KB, or MIN-MAX for a random size per image, 1-10240 (default: 256)")
     parser.add_argument("-p", "--workers", type=int, default=4, help="concurrent issue workers, 1-32 (default: 4)")
+    parser.add_argument(
+        "--generation-workers",
+        type=int,
+        help="parallel image-generation processes (default: min(--workers, CPU count); 1 runs inline)",
+    )
     parser.add_argument("-t", "--title-prefix", default="Attachment load test", help="issue title prefix")
     parser.add_argument("-c", "--config", type=Path, default=DEFAULT_CONF, help="config file (default: ./.gh-api-examples.conf)")
     parser.add_argument("-k", "--insecure", action="store_true", help="skip TLS verification (also enabled by -k in curl_custom_flags)")
@@ -344,6 +412,12 @@ def parse_args():
         parser.error("-i must be between 1 and 100")
     if not 1 <= args.workers <= 32:
         parser.error("-p must be between 1 and 32")
+    if args.generation_workers is not None and not 1 <= args.generation_workers <= 32:
+        parser.error("--generation-workers must be between 1 and 32")
+    if args.generation_workers is None:
+        args.generation_workers = min(args.workers, os.cpu_count() or 1)
+    if args.generation_workers > args.workers:
+        parser.error("--generation-workers cannot exceed -p because each issue generates one image at a time")
     return args
 
 
@@ -390,32 +464,19 @@ def main():
 
     lo, hi = args.size_kb
     print(f">>> Creating {args.issues} issue(s) x {args.images} image(s), "
-          f"{lo // 1024}-{hi // 1024} KB each, {args.workers} worker(s), run {run_id}")
+          f"{lo // 1024}-{hi // 1024} KB each, {args.workers} issue worker(s), "
+          f"{args.generation_workers} generation worker(s), run {run_id}")
 
     Path("tmp").mkdir(exist_ok=True)
     manifest_path = Path("tmp") / f"issue-attachments-{run_id}.jsonl"
     stats = Stats()
     start = time.monotonic()
-    with manifest_path.open("w") as manifest, concurrent.futures.ThreadPoolExecutor(args.workers) as pool:
-        futures = {
-            pool.submit(seed_issue, args, ghes, repo_id, run_id, index, stats, manifest): index
-            for index in range(1, args.issues + 1)
-        }
-        try:
-            for future in concurrent.futures.as_completed(futures):
-                index = futures[future]
-                try:
-                    number, images = future.result()
-                    label = f"#{number}" if number else f"(dry run {index})"
-                    print(f"    OK: issue {label}: {len(images)} image(s), {sum(i['bytes'] for i in images)} bytes")
-                except Exception as err:  # noqa: BLE001 - report and keep seeding other issues
-                    stats.add(failures=1)
-                    print(f"    FAIL: issue {index}: {err}", file=sys.stderr)
-        except KeyboardInterrupt:
-            print("Interrupted; waiting for in-flight uploads to finish", file=sys.stderr)
-            for future in futures:
-                future.cancel()
-            raise
+    with manifest_path.open("w") as manifest:
+        if args.generation_workers > 1:
+            with ProcessPoolExecutor(max_workers=args.generation_workers) as generation_pool:
+                seed_issues(args, ghes, repo_id, run_id, stats, manifest, generation_pool)
+        else:
+            seed_issues(args, ghes, repo_id, run_id, stats, manifest, None)
 
     elapsed = time.monotonic() - start
     mib = stats.bytes / 1024 / 1024
