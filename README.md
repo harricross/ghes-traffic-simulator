@@ -21,6 +21,22 @@ and Prejudice* and *Romeo and Juliet*, is a Git submodule. Clone with
 `git submodule update --init --recursive`. The corpus repository is private, so
 you need access to `harricross/ghes-traffic-sim-testcontent`.
 
+## Copilot App guided load lab
+
+The repository includes the
+[`ghes-load-lab` Copilot skill](.github/skills/ghes-load-lab/SKILL.md).
+Provide the GHES web URL, primary/replica SSH endpoints, and requested data
+sizes or traffic profile. The skill guides Copilot through local SSH-key
+access, Codespace provisioning, secure application authentication, measured
+data generation, traffic canaries, independent disk guards, and scheduled
+five-minute progress updates with percentages and ETAs.
+
+It includes detailed workload and monitoring/recovery runbooks. Run-specific
+orchestration and guards must be implemented and verified before bulk work;
+the skill itself does not install a background service. Local private SSH
+keys stay on the operator's machine. Use disposable test environments and
+explicitly authorize mutations, paid resources, and cleanup.
+
 ## Configure GHES
 
 ```bash
