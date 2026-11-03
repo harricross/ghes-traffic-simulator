@@ -21,6 +21,22 @@ and Prejudice* and *Romeo and Juliet*, is a Git submodule. Clone with
 `git submodule update --init --recursive`. The corpus repository is private, so
 you need access to `harricross/ghes-traffic-sim-testcontent`.
 
+## Copilot App guided load lab
+
+The repository includes the
+[`ghes-load-lab` Copilot skill](.github/skills/ghes-load-lab/SKILL.md).
+Provide the GHES web URL, primary/replica SSH endpoints, and requested data
+sizes or traffic profile. The skill guides Copilot through local SSH-key
+access, Codespace provisioning, secure application authentication, measured
+data generation, traffic canaries, independent disk guards, and scheduled
+five-minute progress updates with percentages and ETAs.
+
+It includes detailed workload and monitoring/recovery runbooks. Run-specific
+orchestration and guards must be implemented and verified before bulk work;
+the skill itself does not install a background service. Local private SSH
+keys stay on the operator's machine. Use disposable test environments and
+explicitly authorize mutations, paid resources, and cleanup.
+
 ## Configure GHES
 
 ```bash
@@ -205,6 +221,8 @@ from a signed-in browser (required for SAML, CAS, or two-factor accounts). The
 web user needs write access to the repository. Issues are created through the
 REST API with the config's `GITHUB_TOKEN`. Each run writes a manifest of issue
 numbers and asset URLs to `tmp/issue-attachments-<run>.jsonl`.
+The uploader accepts the asset URL from either the upload policy or the
+completed upload response, accommodating both GHES upload response formats.
 
 When GHES rate limiting is enabled, each user can create 100 upload policies
 per hour. The script retries `429` responses, but for large runs either disable
