@@ -64,6 +64,18 @@ func runnerName(runID string, index int) string {
 	return fmt.Sprintf("load-%s-%06d", digest, index)
 }
 
+const (
+	fleetKindReal = "r"
+	fleetKindFake = "f"
+)
+
+// fleetRunnerName names a fleet runner in a runner group; kind is
+// fleetKindReal or fleetKindFake. It keeps the run's "load-<hash>-" prefix so
+// prefix-based ownership checks still apply.
+func fleetRunnerName(runID, group, kind string, index int) string {
+	return fmt.Sprintf("load-%s-%s-%s%06d", shortHash(runID), group, kind, index)
+}
+
 func (t *target) registerOne(ctx context.Context, state *runState, index int, dwell time.Duration, held *atomic.Int64) error {
 	name := runnerName(state.data.RunID, index)
 	if err := state.record("runner_registration_intent", map[string]any{"runner_name": name}); err != nil {

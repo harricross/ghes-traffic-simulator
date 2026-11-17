@@ -61,6 +61,10 @@ type workflowRecord struct {
 	Conclusion       string    `json:"conclusion,omitempty"`
 	ExpectedFailures int       `json:"expected_failures"`
 	CompletedSeenAt  time.Time `json:"completed_seen_at,omitzero"`
+	// RunnerLabel and Group are set for fleet dispatches, which target one
+	// runner group's real scale set; jobs must run on that group's runners.
+	RunnerLabel string `json:"runner_label,omitempty"`
+	Group       string `json:"group,omitempty"`
 }
 
 func (r workflowRecord) workload() string {
