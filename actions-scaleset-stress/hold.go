@@ -175,31 +175,131 @@ func (h *holder) count() int {
 	return len(h.runners)
 }
 
-// register creates total runners. It stops growing, without failing, after
-// repeated API errors and reports why; only bookkeeping failures are errors.
+// register creates total runners in the holder's scale set. It stops
+// growing, without failing, at the runner group limit or after repeated API
+// errors and reports why; only bookkeeping failures are errors.
 func (h *holder) register(ctx context.Context, total int) (string, error) {
+	results, err := h.registerTargets(ctx, []holdTarget{{ScaleSetID: h.scaleSetID, Count: total}}, nil)
+	return results[""].CeilingReason, err
+}
+
+// holdTarget is one scale set to fill with registered runners.
+type holdTarget struct {
+	Group      string // "" means legacy single-scale-set hold naming
+	ScaleSetID int
+	Count      int // runners to register into this scale set
+	Online     int // the first Online successful registrations are handed to onJIT
+}
+
+// holdTargetResult reports one target. Ceiling is set when the target
+// stopped early; GroupLimit when GHES reported its runner group full.
+type holdTargetResult struct {
+	Registered, Online, Errors int
+	Ceiling                    bool
+	CeilingReason              string
+	GroupLimit                 bool
+}
+
+type holdTargetRun struct {
+	target holdTarget
+	ctx    context.Context
+	cancel context.CancelFunc
+	next   int // last index handed out; only the feeder uses it
+
+	registered, online, failed, consecutive atomic.Int64
+
+	mu         sync.Mutex
+	reason     string
+	groupLimit bool
+}
+
+// stop ends registration for this target only, unless the whole run is
+// already ending. It reports whether this call stopped the target.
+func (r *holdTargetRun) stop(parent context.Context, reason string, groupLimit bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.reason != "" || parent.Err() != nil {
+		return false
+	}
+	r.reason, r.groupLimit = reason, groupLimit
+	r.cancel()
+	return true
+}
+
+func (r *holdTargetRun) claimOnline() bool {
+	for {
+		n := r.online.Load()
+		if n >= int64(r.target.Online) {
+			return false
+		}
+		if r.online.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+}
+
+func (r *holdTargetRun) result() holdTargetResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return holdTargetResult{
+		Registered: int(r.registered.Load()), Online: int(r.online.Load()), Errors: int(r.failed.Load()),
+		Ceiling: r.reason != "", CeilingReason: r.reason, GroupLimit: r.groupLimit,
+	}
+}
+
+// isRunnerGroupFull reports GHES refusing a registration because the runner
+// group is at its runner limit. The SDK does not export the exception type.
+func isRunnerGroupFull(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "RunnerGroupTooManyRunnersException")
+}
+
+func validateHoldTargets(targets []holdTarget) error {
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if _, dup := seen[target.Group]; dup {
+			return fmt.Errorf("duplicate hold target %q", target.Group)
+		}
+		seen[target.Group] = struct{}{}
+		if target.ScaleSetID <= 0 || target.Count < 0 || target.Online < 0 {
+			return fmt.Errorf("invalid hold target %q: scale set %d, count %d, online %d", target.Group, target.ScaleSetID, target.Count, target.Online)
+		}
+	}
+	return nil
+}
+
+// registerTargets registers each target's Count runners into its scale set,
+// interleaving targets round-robin under the holder's global rate and worker
+// limits so they fill evenly. A runner group limit or repeated failures stop
+// only that target. The first Online registrations per target are passed to
+// onJIT; every other JIT config is discarded at once and none is stored.
+// Results are keyed by target Group.
+func (h *holder) registerTargets(ctx context.Context, targets []holdTarget,
+	onJIT func(target holdTarget, runnerID int, runnerName string, encodedJIT string)) (map[string]holdTargetResult, error) {
+	if err := validateHoldTargets(targets); err != nil {
+		return nil, err
+	}
 	regCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	runs := make([]*holdTargetRun, len(targets))
+	total := 0
+	for i, target := range targets {
+		runCtx, runCancel := context.WithCancel(regCtx)
+		defer runCancel()
+		runs[i] = &holdTargetRun{target: target, ctx: runCtx, cancel: runCancel}
+		total += target.Count
+	}
 
-	var mu sync.Mutex
-	var stopReason string
+	var fatalMu sync.Mutex
 	var fatal error
-	var consecutive, failures atomic.Int64
-	stop := func(reason string, err error) {
-		mu.Lock()
-		defer mu.Unlock()
-		switch {
-		case err != nil:
-			if fatal == nil {
-				fatal = err
-				cancel()
-			}
-		case stopReason == "" && ctx.Err() == nil:
-			stopReason = reason
+	stopAll := func(err error) {
+		fatalMu.Lock()
+		defer fatalMu.Unlock()
+		if fatal == nil {
+			fatal = err
 			cancel()
 		}
 	}
-
+	var failures atomic.Int64
 	progressCtx, stopProgress := context.WithCancel(ctx)
 	progressDone := make(chan struct{})
 	go func() {
@@ -207,92 +307,203 @@ func (h *holder) register(ctx context.Context, total int) (string, error) {
 		h.reportProgress(progressCtx, "registering", total, &failures)
 	}()
 
-	forEachPaced(regCtx, total, h.workers, h.rate, func(i int) {
-		err := h.registerOne(regCtx, i+1)
+	runID := h.state.data.RunID
+	forEachTargetPaced(regCtx, runs, h.workers, h.rate, func(run *holdTargetRun, index int) {
+		if run.ctx.Err() != nil {
+			return
+		}
+		target := run.target
+		name := runnerName(runID, index)
+		if target.Group != "" {
+			name = fleetRunnerName(runID, target.Group, fleetKindFake, index)
+		}
+		id, encodedJIT, err := h.registerOne(run.ctx, target, name)
+		if id > 0 {
+			run.registered.Add(1)
+		}
 		var fatalErr fatalHoldError
 		switch {
 		case err == nil:
-			consecutive.Store(0)
+			run.consecutive.Store(0)
+			if onJIT != nil && run.claimOnline() {
+				onJIT(target, id, name, encodedJIT)
+			}
 		case errors.As(err, &fatalErr):
-			stop("", fatalErr.err)
+			stopAll(fatalErr.err)
 		case ctx.Err() != nil:
+		case run.ctx.Err() != nil:
+			// The target stopped while this call was in flight.
 		default:
 			failures.Add(1)
-			if consecutive.Add(1) >= holdMaxConsecutiveFailures {
-				stop(fmt.Sprintf("%d consecutive registration failures; last: %s", holdMaxConsecutiveFailures, safeError(err)), nil)
+			run.failed.Add(1)
+			var reason string
+			groupLimit := isRunnerGroupFull(err)
+			switch {
+			case groupLimit:
+				reason = "runner group limit reached: " + safeError(err)
+			case run.consecutive.Add(1) >= holdMaxConsecutiveFailures:
+				reason = fmt.Sprintf("%d consecutive registration failures; last: %s", holdMaxConsecutiveFailures, safeError(err))
+			default:
+				return
+			}
+			if run.stop(ctx, reason, groupLimit) && target.Group != "" {
+				_ = h.state.record("hold_target_stopped", map[string]any{
+					"runner_group": target.Group, "scale_set_id": target.ScaleSetID,
+					"registered": run.registered.Load(), "group_limit": groupLimit, "reason": reason,
+				})
 			}
 		}
 	})
 	stopProgress()
 	<-progressDone
-	mu.Lock()
-	defer mu.Unlock()
-	return stopReason, fatal
+
+	results := make(map[string]holdTargetResult, len(runs))
+	for _, run := range runs {
+		results[run.target.Group] = run.result()
+	}
+	fatalMu.Lock()
+	defer fatalMu.Unlock()
+	return results, fatal
 }
 
-func (h *holder) registerOne(ctx context.Context, index int) error {
-	name := runnerName(h.state.data.RunID, index)
-	if err := h.state.record("runner_registration_intent", map[string]any{"runner_name": name}); err != nil {
-		return fatalHoldError{err}
+// forEachTargetPaced hands out 1-based per-target indexes round-robin across
+// targets that are neither exhausted nor stopped, with at most workers calls
+// in flight and at most rate starts per second, until ctx ends.
+func forEachTargetPaced(ctx context.Context, runs []*holdTargetRun, workers int, rate float64, fn func(*holdTargetRun, int)) {
+	type slot struct {
+		run   *holdTargetRun
+		index int
+	}
+	cursor := 0
+	next := func() (slot, bool) {
+		for range runs {
+			run := runs[cursor]
+			cursor = (cursor + 1) % len(runs)
+			if run.next < run.target.Count && run.ctx.Err() == nil {
+				run.next++
+				return slot{run, run.next}, true
+			}
+		}
+		return slot{}, false
+	}
+	interval := time.Duration(float64(time.Second) / rate)
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
+	work := make(chan slot)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for s := range work {
+				fn(s.run, s.index)
+			}
+		}()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+feed:
+	for {
+		s, ok := next()
+		if !ok {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			break feed
+		case <-ticker.C:
+		}
+		select {
+		case work <- s:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(work)
+	wg.Wait()
+}
+
+// holdRunnerFields are the journal fields that attribute a runner to its
+// scale set and, in fleet mode, its runner group.
+func holdRunnerFields(target holdTarget, name string, extra map[string]any) map[string]any {
+	fields := map[string]any{"runner_name": name, "scale_set_id": target.ScaleSetID}
+	if target.Group != "" {
+		fields["runner_group"] = target.Group
+	}
+	for k, v := range extra {
+		fields[k] = v
+	}
+	return fields
+}
+
+// registerOne registers name into the target's scale set and returns the
+// runner ID (also when a failed call is reconciled to an existing runner)
+// and, on success only, the encoded JIT config.
+func (h *holder) registerOne(ctx context.Context, target holdTarget, name string) (int, string, error) {
+	if err := h.state.record("runner_registration_intent", holdRunnerFields(target, name, nil)); err != nil {
+		return 0, "", fatalHoldError{err}
 	}
 	callCtx, cancel := context.WithTimeout(ctx, holdCallTimeout)
 	defer cancel()
 	jit, err := h.api.GenerateJitRunnerConfig(callCtx, &scaleset.RunnerScaleSetJitRunnerSetting{
 		Name:       name,
 		WorkFolder: "_work",
-	}, h.scaleSetID)
+	}, target.ScaleSetID)
 	if err != nil {
-		return h.reconcileRegistration(ctx, name, err)
+		return h.reconcileRegistration(ctx, target, name, err)
 	}
 	if jit == nil || jit.Runner == nil || jit.Runner.ID <= 0 {
-		return h.reconcileRegistration(ctx, name, errors.New("registration returned no runner identity"))
+		return h.reconcileRegistration(ctx, target, name, errors.New("registration returned no runner identity"))
 	}
-	if err := h.track(jit.Runner.ID, name); err != nil {
-		return fatalHoldError{err}
+	id := jit.Runner.ID
+	if err := h.track(id, name, target.ScaleSetID); err != nil {
+		return id, "", fatalHoldError{err}
 	}
-	if err := h.state.record("runner_registered", map[string]any{"runner_id": jit.Runner.ID, "runner_name": name}); err != nil {
-		return fatalHoldError{err}
+	if err := h.state.record("runner_registered", holdRunnerFields(target, name, map[string]any{"runner_id": id})); err != nil {
+		return id, "", fatalHoldError{err}
 	}
-	return nil
+	return id, jit.EncodedJITConfig, nil
 }
 
 // reconcileRegistration resolves a failed registration by name so a runner
-// GHES created is still tracked and removed.
-func (h *holder) reconcileRegistration(ctx context.Context, name string, cause error) error {
+// GHES created is still tracked and removed. It returns the runner ID when
+// one was found.
+func (h *holder) reconcileRegistration(ctx context.Context, target holdTarget, name string, cause error) (int, string, error) {
 	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), holdCallTimeout)
 	defer cancel()
 	observed, lookupErr := h.api.GetRunnerByName(lookupCtx, name)
 	switch {
 	case lookupErr == nil && observed != nil:
-		if err := h.track(observed.ID, name); err != nil {
-			return fatalHoldError{err}
+		if err := h.track(observed.ID, name, target.ScaleSetID); err != nil {
+			return observed.ID, "", fatalHoldError{err}
 		}
-		if err := h.state.record("runner_registered", map[string]any{"runner_id": observed.ID, "runner_name": name, "reconciled": true}); err != nil {
-			return fatalHoldError{err}
+		if err := h.state.record("runner_registered", holdRunnerFields(target, name, map[string]any{"runner_id": observed.ID, "reconciled": true})); err != nil {
+			return observed.ID, "", fatalHoldError{err}
 		}
-		return fmt.Errorf("register %s: %w (runner exists and is tracked)", name, cause)
+		return observed.ID, "", fmt.Errorf("register %s: %w (runner exists and is tracked)", name, cause)
 	case lookupErr == nil:
-		return fmt.Errorf("register %s: %w", name, cause)
+		return 0, "", fmt.Errorf("register %s: %w", name, cause)
 	default:
-		if err := h.track(0, name); err != nil {
-			return fatalHoldError{err}
+		if err := h.track(0, name, target.ScaleSetID); err != nil {
+			return 0, "", fatalHoldError{err}
 		}
 		if err := h.state.update(func(data *runData) { data.Unresolved++ }); err != nil {
-			return fatalHoldError{err}
+			return 0, "", fatalHoldError{err}
 		}
-		if err := h.state.record("runner_registration_unresolved", map[string]any{"runner_name": name}); err != nil {
-			return fatalHoldError{err}
+		if err := h.state.record("runner_registration_unresolved", holdRunnerFields(target, name, nil)); err != nil {
+			return 0, "", fatalHoldError{err}
 		}
-		return errors.Join(fmt.Errorf("register %s: %w", name, cause), lookupErr)
+		return 0, "", errors.Join(fmt.Errorf("register %s: %w", name, cause), lookupErr)
 	}
 }
 
-func (h *holder) track(id int, name string) error {
+func (h *holder) track(id int, name string, scaleSetID int) error {
 	now := time.Now().UTC()
 	pos := -1
 	err := h.state.update(func(data *runData) {
 		pos = len(data.Runners)
-		data.Runners = append(data.Runners, runnerRecord{ID: id, Name: name, CreatedAt: now})
+		data.Runners = append(data.Runners, runnerRecord{ID: id, Name: name, ScaleSetID: scaleSetID, CreatedAt: now})
 	})
 	h.mu.Lock()
 	h.runners = append(h.runners, heldRunner{id: id, name: name, pos: pos, created: now})
@@ -652,6 +863,7 @@ func reconcileRunnersFromJournal(state *runState) error {
 		known[runner.Name] = struct{}{}
 	}
 	ids := make(map[string]int)
+	sets := make(map[string]int)
 	var order []string
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
@@ -661,6 +873,7 @@ func reconcileRunnersFromJournal(state *runState) error {
 			Fields struct {
 				RunnerID   int    `json:"runner_id"`
 				RunnerName string `json:"runner_name"`
+				ScaleSetID int    `json:"scale_set_id"`
 			} `json:"fields"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &event) != nil || event.Fields.RunnerName == "" {
@@ -681,6 +894,11 @@ func reconcileRunnersFromJournal(state *runState) error {
 				order = append(order, name)
 			}
 			ids[name] = event.Fields.RunnerID
+		default:
+			continue
+		}
+		if event.Fields.ScaleSetID > 0 {
+			sets[name] = event.Fields.ScaleSetID
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -692,7 +910,7 @@ func reconcileRunnersFromJournal(state *runState) error {
 	now := time.Now().UTC()
 	return state.update(func(data *runData) {
 		for _, name := range order {
-			data.Runners = append(data.Runners, runnerRecord{ID: ids[name], Name: name, CreatedAt: now})
+			data.Runners = append(data.Runners, runnerRecord{ID: ids[name], Name: name, ScaleSetID: sets[name], CreatedAt: now})
 		}
 	})
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,24 +28,44 @@ type fakeRunnerAPI struct {
 	removeCalls int
 	lookupErr   error
 	dropOnGet   map[string]bool
+	jitSets     []int         // scale set ID of each JIT call, in call order
+	perSet      map[int]int   // runners created per scale set
+	setLimit    map[int]int   // runner group limit per scale set
+	failSet     map[int]error // every JIT call for the scale set fails
 }
 
 func newFakeRunnerAPI() *fakeRunnerAPI {
-	return &fakeRunnerAPI{nextID: 1000, runners: map[string]int{}, dropOnGet: map[string]bool{}}
+	return &fakeRunnerAPI{
+		nextID: 1000, runners: map[string]int{}, dropOnGet: map[string]bool{},
+		perSet: map[int]int{}, setLimit: map[int]int{}, failSet: map[int]error{},
+	}
 }
 
-func (f *fakeRunnerAPI) GenerateJitRunnerConfig(_ context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, _ int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
+func (f *fakeRunnerAPI) GenerateJitRunnerConfig(_ context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.jitCalls++
+	f.jitSets = append(f.jitSets, scaleSetID)
+	if err := f.failSet[scaleSetID]; err != nil {
+		return nil, err
+	}
+	if limit, ok := f.setLimit[scaleSetID]; ok && f.perSet[scaleSetID] >= limit {
+		// Shaped like the SDK's error for GHES's 400 response.
+		return nil, fmt.Errorf("request POST https://ghes.example/_services/pipelines/SECRETtoken/_apis/runtime/runnerscalesets/%d/generatejitconfig failed: %w: RunnerGroupTooManyRunnersException: Runner group 1 has reached max limit of %d runners",
+			scaleSetID, scaleset.BadRequestError, limit)
+	}
 	if f.failJIT != nil {
 		if err := f.failJIT(f.jitCalls); err != nil {
 			return nil, err
 		}
 	}
 	f.nextID++
+	f.perSet[scaleSetID]++
 	f.runners[setting.Name] = f.nextID
-	return &scaleset.RunnerScaleSetJitRunnerConfig{Runner: &scaleset.RunnerReference{ID: f.nextID, Name: setting.Name}}, nil
+	return &scaleset.RunnerScaleSetJitRunnerConfig{
+		Runner:           &scaleset.RunnerReference{ID: f.nextID, Name: setting.Name},
+		EncodedJITConfig: "jit-secret-" + setting.Name,
+	}, nil
 }
 
 func (f *fakeRunnerAPI) GetRunnerByName(_ context.Context, name string) (*scaleset.RunnerReference, error) {
@@ -229,6 +250,201 @@ func TestHoldStopsGrowingAfterRepeatedFailures(t *testing.T) {
 	}
 	if err := h.removeAll(context.Background()); err != nil || api.registered() != 0 {
 		t.Fatalf("removeAll err=%v left=%d", err, api.registered())
+	}
+}
+
+func TestHoldStopsAtRunnerGroupLimit(t *testing.T) {
+	api := newFakeRunnerAPI()
+	api.setLimit[7] = 5
+	state := newTestState(t)
+	h := newTestHolder(api, state)
+	h.workers = 1
+
+	reason, err := h.register(context.Background(), 500)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if !strings.Contains(reason, "runner group limit reached") || strings.Contains(reason, "SECRETtoken") {
+		t.Fatalf("reason=%q, want a redacted runner group limit", reason)
+	}
+	if h.count() != 5 || api.jitCalls != 6 {
+		t.Fatalf("tracked=%d calls=%d, want 5 runners and a stop at the first refusal", h.count(), api.jitCalls)
+	}
+}
+
+func readJournalEvents(t *testing.T, state *runState, name string) []map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(state.dir, "journal.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		var event struct {
+			Event  string         `json:"event"`
+			Fields map[string]any `json:"fields"`
+		}
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("journal line %q: %v", line, err)
+		}
+		if event.Event == name {
+			events = append(events, event.Fields)
+		}
+	}
+	return events
+}
+
+func TestRegisterTargetsInterleavesAndAttributesScaleSets(t *testing.T) {
+	api := newFakeRunnerAPI()
+	state := newTestState(t)
+	h := newTestHolder(api, state)
+	h.workers = 1
+	targets := []holdTarget{
+		{Group: "g01", ScaleSetID: 11, Count: 3},
+		{Group: "g02", ScaleSetID: 12, Count: 1},
+		{Group: "g03", ScaleSetID: 13, Count: 2},
+	}
+	results, err := h.registerTargets(context.Background(), targets, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(api.jitSets), "[11 12 13 11 13 11]"; got != want {
+		t.Fatalf("JIT calls by scale set %s, want round-robin %s", got, want)
+	}
+	want := map[string]int{}
+	for _, target := range targets {
+		if r := results[target.Group]; r.Registered != target.Count || r.Ceiling || r.Errors != 0 || r.Online != 0 {
+			t.Fatalf("%s result %+v", target.Group, r)
+		}
+		for i := 1; i <= target.Count; i++ {
+			want[fleetRunnerName("hold-test", target.Group, fleetKindFake, i)] = target.ScaleSetID
+		}
+	}
+	got := map[string]int{}
+	for _, runner := range state.snapshot().Runners {
+		got[runner.Name] = runner.ScaleSetID
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("state runners %v, want %v", got, want)
+	}
+	events := readJournalEvents(t, state, "runner_registered")
+	if len(events) != len(want) {
+		t.Fatalf("%d runner_registered events, want %d", len(events), len(want))
+	}
+	for _, fields := range events {
+		name, _ := fields["runner_name"].(string)
+		group, _ := fields["runner_group"].(string)
+		setID, _ := fields["scale_set_id"].(float64)
+		if int(setID) != want[name] || !strings.Contains(name, "-"+group+"-f") {
+			t.Fatalf("journal fields %v do not attribute the runner", fields)
+		}
+	}
+
+	// As after a crash before the state was saved, the journal restores
+	// each runner's scale set.
+	if err := state.update(func(data *runData) { data.Runners = nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileRunnersFromJournal(state); err != nil {
+		t.Fatal(err)
+	}
+	got = map[string]int{}
+	for _, runner := range state.snapshot().Runners {
+		got[runner.Name] = runner.ScaleSetID
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("reconciled runners %v, want %v", got, want)
+	}
+}
+
+func TestRegisterTargetsHandsOnlyTheOnlineSubsetToCallback(t *testing.T) {
+	api := newFakeRunnerAPI()
+	state := newTestState(t)
+	h := newTestHolder(api, state)
+	targets := []holdTarget{
+		{Group: "g01", ScaleSetID: 11, Count: 5, Online: 2},
+		{Group: "g02", ScaleSetID: 12, Count: 3, Online: 3},
+		{Group: "g03", ScaleSetID: 13, Count: 2},
+	}
+	var mu sync.Mutex
+	handed := map[string]int{}
+	results, err := h.registerTargets(context.Background(), targets, func(target holdTarget, id int, name, jit string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if id <= 0 || jit != "jit-secret-"+name || !strings.Contains(name, "-"+target.Group+"-f") {
+			t.Errorf("callback got id=%d name=%s for %s", id, name, target.Group)
+		}
+		handed[target.Group]++
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(handed); got != "map[g01:2 g02:3]" {
+		t.Fatalf("JIT configs handed out %s", got)
+	}
+	for _, target := range targets {
+		if r := results[target.Group]; r.Registered != target.Count || r.Online != target.Online {
+			t.Fatalf("%s result %+v", target.Group, r)
+		}
+	}
+	for _, file := range []string{"state.json", "journal.jsonl"} {
+		data, err := os.ReadFile(filepath.Join(state.dir, file))
+		if err != nil || bytes.Contains(data, []byte("jit-secret")) {
+			t.Fatalf("%s must not hold JIT configs (err=%v)", file, err)
+		}
+	}
+}
+
+func TestRegisterTargetsStopsOnlyTheFailingTarget(t *testing.T) {
+	cases := []struct {
+		name       string
+		setup      func(*fakeRunnerAPI)
+		registered int
+		calls      int
+		groupLimit bool
+		reason     string
+	}{
+		{"runner group limit", func(api *fakeRunnerAPI) { api.setLimit[11] = 2 }, 2, 3, true, "runner group limit reached"},
+		{"persistent failures", func(api *fakeRunnerAPI) { api.failSet[11] = errors.New("service unavailable") }, 0, holdMaxConsecutiveFailures, false, "consecutive registration failures"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newFakeRunnerAPI()
+			tc.setup(api)
+			state := newTestState(t)
+			h := newTestHolder(api, state)
+			h.workers = 1
+			results, err := h.registerTargets(context.Background(), []holdTarget{
+				{Group: "g01", ScaleSetID: 11, Count: 30},
+				{Group: "g02", ScaleSetID: 12, Count: 30},
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stopped := results["g01"]
+			if stopped.Registered != tc.registered || !stopped.Ceiling || stopped.GroupLimit != tc.groupLimit ||
+				!strings.Contains(stopped.CeilingReason, tc.reason) || strings.Contains(stopped.CeilingReason, "SECRETtoken") {
+				t.Fatalf("g01 result %+v", stopped)
+			}
+			calls := 0
+			for _, id := range api.jitSets {
+				if id == 11 {
+					calls++
+				}
+			}
+			if calls != tc.calls {
+				t.Fatalf("%d calls to the stopped scale set, want %d", calls, tc.calls)
+			}
+			if other := results["g02"]; other.Registered != 30 || other.Ceiling || api.perSet[12] != 30 {
+				t.Fatalf("g02 result %+v, registered %d: the other target must complete", other, api.perSet[12])
+			}
+			if events := readJournalEvents(t, state, "hold_target_stopped"); len(events) != 1 || events[0]["runner_group"] != "g01" {
+				t.Fatalf("hold_target_stopped events %v", events)
+			}
+			if err := h.removeAll(context.Background()); err != nil || api.registered() != 0 {
+				t.Fatalf("removeAll err=%v left=%d", err, api.registered())
+			}
+		})
 	}
 }
 
