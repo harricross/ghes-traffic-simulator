@@ -162,6 +162,8 @@ type runOptions struct {
 	fleet              fleetSpec
 	openConcurrency    int
 	dispatchRate       float64
+	fakeJobPercent     int
+	fakeJobDuration    time.Duration
 }
 
 func commandRun(args []string) error {
@@ -172,6 +174,8 @@ func commandRun(args []string) error {
 	fs.StringVar(&o.fleetPath, "fleet", "", "fleet mode: JSON spec of runner groups and their real, online and offline runner counts")
 	fs.IntVar(&o.openConcurrency, "open-concurrency", 6, "fleet mode: concurrent session opens for fake-online runners")
 	fs.Float64Var(&o.dispatchRate, "dispatch-rate", 0.5, "fleet mode: maximum workflow dispatches per second")
+	fs.IntVar(&o.fakeJobPercent, "fake-job-percent", 100, "fleet mode: percentage of dispatches sent to fake_jobs groups when the fleet also has real runners")
+	fs.DurationVar(&o.fakeJobDuration, "fake-job-duration", 5*time.Second, "fleet mode: how long a fake runner holds each job before completing it")
 	fs.StringVar(&o.workload, "workload", workloadSynthetic, "workflows mode: synthetic (matrix sleep jobs) or ci (Lint, sharded unit tests, Build)")
 	fs.StringVar(&o.runID, "run-id", "", "run identifier (default: generated)")
 	fs.DurationVar(&o.duration, "duration", time.Minute, "hard maximum run duration")
@@ -313,7 +317,7 @@ func commandRun(args []string) error {
 		_ = state.record("run_stopped", map[string]any{"reason": ctx.Err().Error()})
 	}
 	printScaleSummary(os.Stdout, o.mode, state.snapshot().Scale)
-	if o.mode == "workflows" || (o.mode == modeFleet && fleetPlan.Real > 0) {
+	if o.mode == "workflows" || (o.mode == modeFleet && fleetPlan.dispatches()) {
 		summary := state.snapshot()
 		fmt.Printf("Workflow runs (%s): %d dispatched, %d passed, %d failed intentionally as requested, %d failed verification, %d unresolved\n",
 			o.workload, summary.Attempts, summary.Passed, summary.IntentionalFailures, summary.Failed, summary.Unresolved)
@@ -397,6 +401,10 @@ func (o runOptions) validate() error {
 		return errors.New("--open-concurrency must be between 1 and 64")
 	case o.mode == modeFleet && (o.dispatchRate <= 0 || o.dispatchRate > 10):
 		return errors.New("--dispatch-rate must be > 0 and <= 10 dispatches per second")
+	case o.fakeJobPercent < 0 || o.fakeJobPercent > 100:
+		return errors.New("--fake-job-percent must be between 0 and 100")
+	case o.fakeJobDuration < 0 || o.fakeJobDuration > 10*time.Minute:
+		return errors.New("--fake-job-duration must be between 0 and 10m")
 	case o.runnerMemoryMiB < 256 || o.runnerMemoryMiB > 65536:
 		return errors.New("--runner-memory-mib must be between 256 and 65536")
 	case o.runnerCPUs <= 0 || o.runnerCPUs > 32:

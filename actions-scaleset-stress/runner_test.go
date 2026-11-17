@@ -33,7 +33,7 @@ func TestRunnerPoolNamesIncludeGroup(t *testing.T) {
 	if want := fleetRunnerName("test-run", "stress-g01", fleetKindReal, 3); name != want {
 		t.Errorf("group runner name = %q, want %q", name, want)
 	}
-	if ok, reason := verifyJobPlacement([]apiJob{{Name: "job", Conclusion: "success", RunnerName: name}}, "test-run", "stress-g01"); !ok {
+	if ok, reason := verifyJobPlacement([]apiJob{{Name: "job", Conclusion: "success", RunnerName: name}}, "test-run", "stress-g01", fleetKindReal); !ok {
 		t.Errorf("group runner name is not recognised as the group's: %s", reason)
 	}
 	if got, want := grouped.containerNameFor(3), "ghes-load-"+shortHash("test-run")+"-stress-g01-000003"; got != want {

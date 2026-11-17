@@ -632,4 +632,46 @@ func TestHoldModeValidation(t *testing.T) {
 	if err := other.validate(); err == nil {
 		t.Fatal("a 2h dwell outside hold mode must be rejected")
 	}
+	for name, mutate := range map[string]func(*runOptions){
+		"fake percent":  func(o *runOptions) { o.fakeJobPercent = 101 },
+		"fake duration": func(o *runOptions) { o.fakeJobDuration = 11 * time.Minute },
+	} {
+		bad := base
+		mutate(&bad)
+		if err := bad.validate(); err == nil || !strings.Contains(err.Error(), "--fake-job") {
+			t.Errorf("%s: validate() = %v, want a --fake-job flag error", name, err)
+		}
+	}
+}
+
+func TestRegisterReplacementRetriesWithFreshNameAndConsumedRunnersAreNotSampled(t *testing.T) {
+	api := newFakeRunnerAPI()
+	api.failJIT = func(call int) error {
+		if call == 1 {
+			return errors.New("runner group briefly full")
+		}
+		return nil
+	}
+	h := newTestHolder(api, newTestState(t))
+	n := 0
+	next := func() string { n++; return fmt.Sprintf("fake-%d", n) }
+	id, name, jit, err := h.registerReplacement(context.Background(), holdTarget{Group: "g", ScaleSetID: 7, Count: 1}, next)
+	if err != nil || id == 0 || name != "fake-2" || jit != "jit-secret-fake-2" {
+		t.Fatalf("registerReplacement() = %d, %q, %q, %v; want fake-2 after one retry", id, name, jit, err)
+	}
+	if h.count() != 1 || len(h.pick(5, true)) != 1 {
+		t.Fatalf("replacement not tracked: count %d", h.count())
+	}
+	h.consume("fake-2")
+	if picks := h.pick(5, true); len(picks) != 0 {
+		t.Fatalf("a consumed runner must not be sampled, got %v", picks)
+	}
+	if picks := h.pick(5, false); len(picks) != 1 {
+		t.Fatalf("a consumed runner is still removed at teardown, got %v", picks)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, _, err := h.registerReplacement(cancelled, holdTarget{Group: "g", ScaleSetID: 7, Count: 1}, next); !errors.Is(err, context.Canceled) {
+		t.Fatalf("registerReplacement after cancel = %v", err)
+	}
 }

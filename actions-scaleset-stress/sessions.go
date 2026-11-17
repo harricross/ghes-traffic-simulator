@@ -2,9 +2,9 @@ package main
 
 // Protocol-only runner sessions. A probeRunner turns a JIT config into an
 // open runner session that GHES shows as idle, without starting the runner.
-// It only long-polls: any message it receives is counted by type and never
-// acted upon, so it can't take a job. JIT configs, tokens and RSA parameters
-// stay in memory and are never logged or journaled.
+// It long-polls, and any message it receives is counted by type and not acted
+// upon, unless its group runs fake jobs (fakejobs.go). JIT configs, tokens
+// and RSA parameters stay in memory and are never logged or journaled.
 
 import (
 	"bytes"
@@ -225,7 +225,8 @@ func (p *probeHTTP) do(ctx context.Context, method, target, token, accept string
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// Job messages carry the whole job definition, so allow a large body.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	return resp.StatusCode, data, err
 }
 
@@ -303,17 +304,22 @@ type probeRunner struct {
 	counters *sessionCounters
 	// messageBackoff pauses polling after a message; zero polls again at once.
 	messageBackoff time.Duration
+	// jobs, when set, makes the runner accept and complete one job.
+	jobs *fakeJobConfig
+	// fatal reports a fake-job failure that should stop the run.
+	fatal func(error)
 
-	token     string
-	sessionID string
-	stage     atomic.Value
-	lastErr   atomic.Value
-	polls     atomic.Int64
-	messages  atomic.Int64
-	emptyPoll atomic.Int64
-	msgTypes  sync.Map
-	sessionMS atomic.Int64
-	tokenMS   atomic.Int64
+	token      string
+	sessionID  string
+	sessionKey []byte
+	stage      atomic.Value
+	lastErr    atomic.Value
+	polls      atomic.Int64
+	messages   atomic.Int64
+	emptyPoll  atomic.Int64
+	msgTypes   sync.Map
+	sessionMS  atomic.Int64
+	tokenMS    atomic.Int64
 }
 
 func (r *probeRunner) setStage(stage string) { r.stage.Store(stage) }
@@ -375,12 +381,21 @@ func (r *probeRunner) openSession(ctx context.Context) error {
 		return fmt.Errorf("create session returned HTTP %d: %s", status, snippet(data))
 	}
 	var out struct {
-		SessionID string `json:"sessionId"`
+		SessionID     string                `json:"sessionId"`
+		EncryptionKey *sessionEncryptionKey `json:"encryptionKey"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil || out.SessionID == "" {
 		return errors.New("create session response has no sessionId")
 	}
 	r.sessionID = out.SessionID
+	if r.jobs != nil {
+		// Only job messages are decrypted, so other runners skip the key.
+		key, err := decodeSessionKey(r.jit.key, out.EncryptionKey)
+		if err != nil {
+			return err
+		}
+		r.sessionKey = key
+	}
 	r.sessionMS.Store(time.Since(start).Milliseconds())
 	r.setStage("session_open")
 	return nil
@@ -406,8 +421,9 @@ func (r *probeRunner) pollError(msg string) {
 	}
 }
 
-// poll long-polls for messages until ctx ends. Messages are only counted:
-// a fake runner never acquires, renews or completes a job.
+// poll long-polls for messages until ctx ends. Messages are only counted,
+// except that a runner with a fake-job config handles its first job and
+// then returns.
 func (r *probeRunner) poll(ctx context.Context) {
 	_, messageURL, accept, err := r.urls()
 	if err != nil {
@@ -444,12 +460,18 @@ func (r *probeRunner) poll(ctx context.Context) {
 			sleepCtx(ctx, sessionRetryDelay)
 		case status == http.StatusOK && len(bytes.TrimSpace(data)) > 0:
 			r.messages.Add(1)
-			var msg struct {
-				MessageType string `json:"messageType"`
-			}
+			var msg probeMessage
 			_ = json.Unmarshal(data, &msg)
 			count, _ := r.msgTypes.LoadOrStore(msg.MessageType, new(atomic.Int64))
 			count.(*atomic.Int64).Add(1)
+			if r.jobs != nil && strings.EqualFold(msg.MessageType, fakeJobMessageType) {
+				r.handleJob(ctx, msg)
+				return
+			}
+			if r.jobs != nil && strings.EqualFold(msg.MessageType, fakeJobBrokerMessageType) {
+				r.jobFatal(fmt.Errorf("fake runner %s in group %s received a broker job message, which fake jobs do not support", r.name, r.counters.group))
+				return
+			}
 			if c := r.counters; c != nil {
 				c.noteUnexpected(msg.MessageType, r.name)
 			}
@@ -498,7 +520,9 @@ func (r *probeRunner) closeSession(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if status != http.StatusOK && status != http.StatusNoContent {
+	// 404: the session is already gone, as it is once GHES deletes an
+	// ephemeral runner after its job.
+	if status != http.StatusOK && status != http.StatusNoContent && status != http.StatusNotFound {
 		return fmt.Errorf("delete session returned HTTP %d: %s", status, snippet(data))
 	}
 	r.sessionID = ""
@@ -561,6 +585,9 @@ type sessionGroupStats struct {
 	UnexpectedTypes                                            map[string]int64
 	LastError                                                  string // redacted
 	Opened, Closed, CloseErrors, TokenRefreshes                int64
+	// Fake-job counters; all zero unless the group runs fake jobs.
+	JobsReceived, JobsSucceeded, JobsFailed, JobsCanceled, JobErrors int64
+	Replacements, ReplaceErrors                                      int64
 }
 
 type sessionCounters struct {
@@ -569,6 +596,9 @@ type sessionCounters struct {
 
 	requested, open, opened, openFailed, closed, closeErrors atomic.Int64
 	polls, pollErrors, unexpected, refreshes                 atomic.Int64
+
+	jobsReceived, jobsSucceeded, jobsFailed, jobsCanceled, jobErrors atomic.Int64
+	replacements, replaceErrors                                      atomic.Int64
 
 	mu      sync.Mutex
 	types   map[string]int64
@@ -608,6 +638,9 @@ func (c *sessionCounters) snapshot() sessionGroupStats {
 		Polls: c.polls.Load(), PollErrors: c.pollErrors.Load(), Unexpected: c.unexpected.Load(),
 		UnexpectedTypes: types, LastError: c.lastErr,
 		Opened: c.opened.Load(), Closed: c.closed.Load(), CloseErrors: c.closeErrors.Load(), TokenRefreshes: c.refreshes.Load(),
+		JobsReceived: c.jobsReceived.Load(), JobsSucceeded: c.jobsSucceeded.Load(), JobsFailed: c.jobsFailed.Load(),
+		JobsCanceled: c.jobsCanceled.Load(), JobErrors: c.jobErrors.Load(),
+		Replacements: c.replacements.Load(), ReplaceErrors: c.replaceErrors.Load(),
 	}
 }
 
@@ -631,6 +664,10 @@ type sessionManager struct {
 	closed   bool
 	sessions []*probeRunner
 	groups   map[string]*sessionCounters
+	jobs     map[string]*fakeJobConfig
+
+	// fatal holds the first fake-job failure.
+	fatal chan error
 
 	closeMu sync.Mutex
 }
@@ -653,6 +690,25 @@ func newSessionManager(httpClient *http.Client, openConcurrency int, runnerVersi
 		ctx:              ctx,
 		cancel:           cancel,
 		groups:           map[string]*sessionCounters{},
+		jobs:             map[string]*fakeJobConfig{},
+		fatal:            make(chan error, 1),
+	}
+}
+
+// setFakeJobs makes the group's sessions added from now on run fake jobs.
+func (m *sessionManager) setFakeJobs(group string, cfg *fakeJobConfig) {
+	m.mu.Lock()
+	m.jobs[group] = cfg
+	m.mu.Unlock()
+}
+
+// fatalErrors delivers the first fake-job failure, which should end the run.
+func (m *sessionManager) fatalErrors() <-chan error { return m.fatal }
+
+func (m *sessionManager) reportFatal(err error) {
+	select {
+	case m.fatal <- err:
+	default:
 	}
 }
 
@@ -680,6 +736,7 @@ func (m *sessionManager) add(ctx context.Context, group string, runnerID int, ru
 	r := &probeRunner{
 		name: runnerName, id: runnerID, http: m.http, owner: m.owner, ver: m.version,
 		counters: counters, messageBackoff: m.messageBackoff,
+		jobs: m.jobs[group], fatal: m.reportFatal,
 	}
 	r.setStage("queued")
 	m.sessions = append(m.sessions, r)

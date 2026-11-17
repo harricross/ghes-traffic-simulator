@@ -61,7 +61,7 @@ func TestVerifySyntheticJobs(t *testing.T) {
 			job("synthetic (0)", "success", "success", "success", "skipped"),
 			job("synthetic (1)", "success", "success", "success", "skipped"),
 		}
-		if ok, reason := verifySyntheticJobs(jobs, 2, 0); !ok {
+		if ok, reason := verifySyntheticJobs(jobs, 2, 0, true); !ok {
 			t.Fatalf("expected valid successful workflow, got %q", reason)
 		}
 	})
@@ -71,14 +71,14 @@ func TestVerifySyntheticJobs(t *testing.T) {
 			job("synthetic (shard: 0)", "failure", "success", "success", "failure"),
 			job("synthetic (shard: 1)", "success", "success", "success", "skipped"),
 		}
-		if ok, reason := verifySyntheticJobs(jobs, 2, 1); !ok {
+		if ok, reason := verifySyntheticJobs(jobs, 2, 1, true); !ok {
 			t.Fatalf("expected valid intentional failure, got %q", reason)
 		}
 	})
 
 	t.Run("fails if output was not verified", func(t *testing.T) {
 		jobs := []apiJob{job("synthetic (0)", "failure", "success", "failure", "failure")}
-		if ok, _ := verifySyntheticJobs(jobs, 1, 1); ok {
+		if ok, _ := verifySyntheticJobs(jobs, 1, 1, true); ok {
 			t.Fatal("expected output verification failure")
 		}
 	})
@@ -88,7 +88,7 @@ func TestVerifySyntheticJobs(t *testing.T) {
 			job("synthetic (0)", "success", "success", "success", "skipped"),
 			job("synthetic (shard: 0)", "success", "success", "success", "skipped"),
 		}
-		if ok, _ := verifySyntheticJobs(jobs, 2, 0); ok {
+		if ok, _ := verifySyntheticJobs(jobs, 2, 0, true); ok {
 			t.Fatal("expected duplicate shard to be rejected")
 		}
 	})
@@ -144,18 +144,18 @@ func TestVerifyCIJobs(t *testing.T) {
 
 	t.Run("all checks pass", func(t *testing.T) {
 		jobs := []apiJob{lint, test(0, "success", "skipped"), test(1, "success", "skipped"), build}
-		if ok, reason := verifyCIJobs(jobs, 2, 0); !ok {
+		if ok, reason := verifyCIJobs(jobs, 2, 0, true); !ok {
 			t.Fatalf("expected passing CI run, got %q", reason)
 		}
 	})
 
 	t.Run("intentional failure skips or omits Build", func(t *testing.T) {
 		failing := []apiJob{lint, test(0, "failure", "failure"), test(1, "success", "skipped")}
-		if ok, reason := verifyCIJobs(failing, 2, 1); !ok {
+		if ok, reason := verifyCIJobs(failing, 2, 1, true); !ok {
 			t.Fatalf("expected intentional failure without Build, got %q", reason)
 		}
 		skipped := append(failing, testJob("Build", "skipped"))
-		if ok, reason := verifyCIJobs(skipped, 2, 1); !ok {
+		if ok, reason := verifyCIJobs(skipped, 2, 1, true); !ok {
 			t.Fatalf("expected intentional failure with skipped Build, got %q", reason)
 		}
 	})
@@ -167,7 +167,7 @@ func TestVerifyCIJobs(t *testing.T) {
 			"failed lint":   {testJob("Lint", "failure", "Lint sources", "failure"), testJob("Test shard ${{ matrix.shard }}", "skipped")},
 			"unknown job":   {lint, test(0, "success", "skipped"), build, testJob("Deploy", "success")},
 		} {
-			if ok, _ := verifyCIJobs(jobs, 1, 0); ok {
+			if ok, _ := verifyCIJobs(jobs, 1, 0, true); ok {
 				t.Errorf("%s: expected verification failure", name)
 			}
 		}
@@ -295,6 +295,62 @@ func TestWorkflowsDefaultRunnerLabelToScaleSet(t *testing.T) {
 	}
 }
 
+func TestVerifyWorkflowRunAcceptsFakeJobsWithoutSteps(t *testing.T) {
+	fake := func(name, conclusion string) apiJob {
+		job := testJob(name, conclusion)
+		job.RunnerName = fleetRunnerName("run", "stress-g01", fleetKindFake, 3)
+		return job
+	}
+	ci := workflowRecord{Workload: workloadCI, Shards: 2, ExpectedFailures: 1, Group: "stress-g01", FakeJobs: true}
+	failing := []apiJob{fake("Lint", "success"), fake("Test shard 0", "failure"), fake("Test shard 1", "success"), testJob("Build", "skipped")}
+	if ok, reason := verifyWorkflowRun(ci, "run", failing); !ok {
+		t.Fatalf("fake CI run rejected: %s", reason)
+	}
+	real := ci
+	real.FakeJobs = false
+	if ok, _ := verifyWorkflowRun(real, "run", failing); ok {
+		t.Fatal("a real-runner run must still check placement and steps")
+	}
+	unexpected := []apiJob{fake("Lint", "success"), fake("Test shard 0", "failure"), fake("Test shard 1", "failure"), testJob("Build", "skipped")}
+	if ok, _ := verifyWorkflowRun(ci, "run", unexpected); ok {
+		t.Fatal("fake jobs must still match expected conclusions")
+	}
+	onReal := append([]apiJob{}, failing...)
+	onReal[0].RunnerName = fleetRunnerName("run", "stress-g01", fleetKindReal, 1)
+	if ok, reason := verifyWorkflowRun(ci, "run", onReal); ok || !strings.Contains(reason, "outside group") {
+		t.Fatalf("a fake-jobs run on a real runner verified %v (%s)", ok, reason)
+	}
+	synthetic := workflowRecord{Workload: workloadSynthetic, Shards: 2, ExpectedFailures: 1, Group: "stress-g01", FakeJobs: true}
+	if ok, reason := verifyWorkflowRun(synthetic, "run", []apiJob{fake("synthetic (0)", "failure"), fake("synthetic (1)", "success")}); !ok {
+		t.Fatalf("fake synthetic run rejected: %s", reason)
+	}
+}
+
+func TestTargetPickerSplitsRealAndFakeTargets(t *testing.T) {
+	r1, r2 := dispatchTarget{Group: "g1", Label: "r1"}, dispatchTarget{Group: "g2", Label: "r2"}
+	f1 := dispatchTarget{Group: "g1", Label: "f1", FakeJobs: true}
+	for _, tc := range []struct {
+		targets []dispatchTarget
+		percent int
+		want    string
+	}{
+		{[]dispatchTarget{r1, r2, f1}, 50, "r1 f1 r2 f1 r1 f1"},
+		{[]dispatchTarget{r1, f1}, 0, "r1 r1 r1 r1 r1 r1"},
+		{[]dispatchTarget{r1, f1}, 100, "f1 f1 f1 f1 f1 f1"},
+		{[]dispatchTarget{f1}, 0, "f1 f1 f1 f1 f1 f1"},
+		{[]dispatchTarget{r1, r2}, 100, "r1 r2 r1 r2 r1 r2"},
+	} {
+		p := newTargetPicker(tc.targets, tc.percent)
+		var got []string
+		for i := 0; i < 6; i++ {
+			got = append(got, p.next(i).Label)
+		}
+		if strings.Join(got, " ") != tc.want {
+			t.Errorf("%d%% of %v: got %v, want %s", tc.percent, tc.targets, got, tc.want)
+		}
+	}
+}
+
 func TestVerifyWorkflowRunChecksGroupPlacement(t *testing.T) {
 	job := func(runner, group string) apiJob {
 		job := testJob("synthetic (0)", "success", "Synthetic work and output", "success", "Verify synthetic output", "success")
@@ -333,7 +389,7 @@ func TestVerifyWorkflowRunChecksGroupPlacement(t *testing.T) {
 		t.Errorf("records without a group must not check placement: %s", reason)
 	}
 	skipped := testJob("Build", "skipped")
-	if ok, reason := verifyJobPlacement([]apiJob{skipped}, "run", "stress-g01"); !ok {
+	if ok, reason := verifyJobPlacement([]apiJob{skipped}, "run", "stress-g01", fleetKindReal); !ok {
 		t.Errorf("a skipped job has no runner and must pass placement: %s", reason)
 	}
 }
@@ -422,7 +478,7 @@ func TestDispatchAndObserveRoundRobinsAcrossPools(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := dispatchAndObserve(ctx, tgt, state, options, pools, time.Millisecond); err != nil {
+	if err := dispatchAndObserve(ctx, tgt, state, options, pools, nil, time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"load-scale-g1-real", "load-scale-g2-real", "load-scale-g1-real", "load-scale-g2-real"}
@@ -447,7 +503,7 @@ func TestDispatchAndObserveFailsWhenAnyListenerExits(t *testing.T) {
 	options := runOptions{total: 1, rate: 1000, workload: workloadSynthetic, jobsPerRun: 1}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err := dispatchAndObserve(ctx, tgt, state, options, pools, time.Millisecond)
+	err := dispatchAndObserve(ctx, tgt, state, options, pools, nil, time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "listener for group g2 stopped unexpectedly") {
 		t.Fatalf("error = %v, want the g2 listener exit", err)
 	}

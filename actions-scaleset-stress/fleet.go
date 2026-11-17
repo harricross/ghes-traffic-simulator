@@ -33,6 +33,9 @@ type fleetGroupSpec struct {
 	Real    int    `json:"real"`
 	Online  int    `json:"online"`
 	Offline int    `json:"offline"`
+	// FakeJobs makes the group's fake-online runners accept dispatched jobs
+	// and complete them with canned results instead of only idling.
+	FakeJobs bool `json:"fake_jobs,omitempty"`
 }
 
 func (g fleetGroupSpec) total() int { return g.Real + g.Online + g.Offline }
@@ -94,6 +97,9 @@ func (s fleetSpec) validate(scaleSetName string) error {
 		if g.total() == 0 {
 			return fmt.Errorf("fleet group %s must have at least one runner", full)
 		}
+		if g.FakeJobs && g.Online == 0 {
+			return fmt.Errorf("fleet group %s sets fake_jobs but has no fake-online runners to run them", full)
+		}
 		if g.total() > runnerGroupLimit {
 			return fmt.Errorf("fleet group %s asks for %d runners; a runner group holds at most %d", full, g.total(), runnerGroupLimit)
 		}
@@ -120,6 +126,7 @@ func (s fleetSpec) checkCapacity(existing map[string]int) error {
 
 type fleetBudget struct {
 	Real, Online, Offline, Fake int
+	FakeJobGroups               int // groups whose fake-online runners run jobs
 	SessionBytes                uint64
 	FileDescriptors             uint64
 	Fill, Ramp, Dispatch        time.Duration
@@ -138,13 +145,16 @@ func (s fleetSpec) budget(rate, rampRate, dispatchRate float64, dispatches int, 
 		b.Online += g.Online
 		b.Offline += g.Offline
 		maxReal = max(maxReal, g.Real)
+		if g.FakeJobs {
+			b.FakeJobGroups++
+		}
 	}
 	b.Fake = b.Online + b.Offline
 	b.SessionBytes = uint64(b.Online) * sessionBytesPer
 	b.FileDescriptors = uint64(b.Online) + fileDescriptorBase
 	b.Fill = secondsAt(b.Fake, rate)
 	b.Ramp = secondsAt(maxReal, rampRate)
-	if b.Real > 0 {
+	if b.dispatches() {
 		b.Dispatch = secondsAt(dispatches, dispatchRate)
 	}
 	b.Removal = b.Fill
@@ -201,12 +211,17 @@ func prepareFleetOptions(o *runOptions, cfg config) (fleetBudget, error) {
 	return b, nil
 }
 
+// dispatches reports whether the fleet has runners that take workflows.
+func (b fleetBudget) dispatches() bool { return b.Real > 0 || b.FakeJobGroups > 0 }
+
 func (b fleetBudget) check(o runOptions, cfg config) error {
 	switch {
 	case b.Real > 0 && cfg.RunnerImage == "":
 		return errors.New("runner_image must be a pinned digest reference when the fleet has real runners")
-	case b.Real > 0 && o.total > 100:
+	case b.dispatches() && o.total > 100:
 		return errors.New("fleet mode is limited to 100 workflow dispatches per run")
+	case b.FakeJobGroups > 0 && b.Real == 0 && o.fakeJobPercent != 100:
+		return errors.New("--fake-job-percent must be 100 when the fleet has no real runners")
 	case b.Real > o.maxRunners:
 		return fmt.Errorf("the fleet asks for %d real runners but --max-runners is %d", b.Real, o.maxRunners)
 	case o.duration < b.MinDuration:

@@ -44,7 +44,7 @@ func runWorkflowLoad(ctx context.Context, t *target, state *runState, options ru
 	}
 	pools := []*realPool{pool}
 
-	workErr := dispatchAndObserve(ctx, t, state, options, pools, 0)
+	workErr := dispatchAndObserve(ctx, t, state, options, pools, nil, 0)
 	if workErr != nil {
 		drainCtx, cancel := context.WithTimeout(context.Background(), options.drainTimeout)
 		if err := cancelActiveWorkflows(drainCtx, t, state, options.drainTimeout); err != nil {
@@ -301,9 +301,54 @@ func waitPoolsRamped(ctx context.Context, state *runState, pools []*realPool, ti
 	})
 }
 
-// dispatchPool assigns dispatches to pools round-robin.
-func dispatchPool(pools []*realPool, dispatched int) *realPool {
-	return pools[dispatched%len(pools)]
+// dispatchTarget is a runner_label that workflows are dispatched to: a real
+// pool's scale set, or a fake_jobs group's fake scale set.
+type dispatchTarget struct {
+	// Group is the runner group; empty in workflows mode.
+	Group string
+	// Label is the runner_label input; empty uses the workflow default.
+	Label    string
+	FakeJobs bool
+}
+
+func poolTargets(pools []*realPool) []dispatchTarget {
+	targets := make([]dispatchTarget, 0, len(pools))
+	for _, r := range pools {
+		targets = append(targets, dispatchTarget{Group: r.Group, Label: r.Label})
+	}
+	return targets
+}
+
+// targetPicker sends fakePercent of dispatches to fake-job targets when
+// both kinds exist, round-robin within each kind.
+type targetPicker struct {
+	real, fake   []dispatchTarget
+	fakePercent  int
+	nReal, nFake int
+}
+
+func newTargetPicker(targets []dispatchTarget, fakePercent int) *targetPicker {
+	p := &targetPicker{fakePercent: fakePercent}
+	for _, target := range targets {
+		if target.FakeJobs {
+			p.fake = append(p.fake, target)
+		} else {
+			p.real = append(p.real, target)
+		}
+	}
+	return p
+}
+
+func (p *targetPicker) next(dispatched int) dispatchTarget {
+	useFake := len(p.real) == 0 || (len(p.fake) > 0 && runFails(dispatched, p.fakePercent))
+	if useFake {
+		target := p.fake[p.nFake%len(p.fake)]
+		p.nFake++
+		return target
+	}
+	target := p.real[p.nReal%len(p.real)]
+	p.nReal++
+	return target
 }
 
 func poolActiveJobs(pools []*realPool) int {
@@ -315,12 +360,17 @@ func poolActiveJobs(pools []*realPool) int {
 }
 
 // dispatchAndObserve ramps the pools' standing runners, dispatches --total
-// workflows round-robin across the pools and waits for every run to finish
-// and be verified. interval paces dispatches; zero uses --rate.
-func dispatchAndObserve(ctx context.Context, t *target, state *runState, options runOptions, pools []*realPool, interval time.Duration) error {
-	if len(pools) == 0 {
-		return errors.New("no runner pools to dispatch to")
+// workflows across targets and waits for every run to finish and be
+// verified. nil targets means one per pool. interval paces dispatches; zero
+// uses --rate.
+func dispatchAndObserve(ctx context.Context, t *target, state *runState, options runOptions, pools []*realPool, targets []dispatchTarget, interval time.Duration) error {
+	if targets == nil {
+		targets = poolTargets(pools)
 	}
+	if len(targets) == 0 {
+		return errors.New("no runners to dispatch to")
+	}
+	picker := newTargetPicker(targets, options.fakeJobPercent)
 	done := make(chan struct{})
 	defer close(done)
 	events := watchPools(pools, done)
@@ -362,7 +412,7 @@ func dispatchAndObserve(ctx context.Context, t *target, state *runState, options
 			return ctx.Err()
 		}
 		if dispatched < options.total && outstandingJobs+jobs <= options.maxOutstandingJobs && !time.Now().Before(nextDispatch) {
-			r := dispatchPool(pools, dispatched)
+			r := picker.next(dispatched)
 			marker := fmt.Sprintf("%s-%04d", state.data.RunID, dispatched+1)
 			failures := []int{}
 			if runFails(dispatched, options.failPercent) {
@@ -377,13 +427,16 @@ func dispatchAndObserve(ctx context.Context, t *target, state *runState, options
 			if r.Group != "" {
 				intent["group"] = r.Group
 			}
+			if r.FakeJobs {
+				intent["fake_jobs"] = true
+			}
 			if err := state.record("workflow_dispatch_intent", intent); err != nil {
 				return err
 			}
 			record := workflowRecord{
 				Marker: marker, CreatedAt: time.Now().UTC(), Status: "dispatching",
 				Workload: options.workload, Shards: options.jobsPerRun, Jobs: jobs, ExpectedFailures: len(failures),
-				RunnerLabel: r.Label, Group: r.Group,
+				RunnerLabel: r.Label, Group: r.Group, FakeJobs: r.FakeJobs,
 			}
 			if err := state.update(func(data *runData) {
 				data.Attempts++
@@ -640,21 +693,27 @@ func minObservedJobs(record workflowRecord) int {
 
 func verifyWorkflowRun(record workflowRecord, runID string, jobs []apiJob) (bool, string) {
 	if record.Group != "" {
-		if ok, reason := verifyJobPlacement(jobs, runID, record.Group); !ok {
+		kind := fleetKindReal
+		if record.FakeJobs {
+			kind = fleetKindFake
+		}
+		if ok, reason := verifyJobPlacement(jobs, runID, record.Group, kind); !ok {
 			return false, reason
 		}
 	}
+	// Fake runners report only a job result, so their jobs have no steps.
+	checkSteps := !record.FakeJobs
 	if record.workload() == workloadCI {
-		return verifyCIJobs(jobs, record.shards(), record.ExpectedFailures)
+		return verifyCIJobs(jobs, record.shards(), record.ExpectedFailures, checkSteps)
 	}
-	return verifySyntheticJobs(jobs, record.shards(), record.ExpectedFailures)
+	return verifySyntheticJobs(jobs, record.shards(), record.ExpectedFailures, checkSteps)
 }
 
 // verifyJobPlacement checks that every job that ran used a runner from group.
 // It prefers the reported runner group and otherwise requires this run's
-// exact real-runner name for group. Jobs that never ran, such as a skipped
-// Build, have no runner.
-func verifyJobPlacement(jobs []apiJob, runID, group string) (bool, string) {
+// exact runner name of kind for group. Jobs that never ran, such as a
+// skipped Build, have no runner.
+func verifyJobPlacement(jobs []apiJob, runID, group, kind string) (bool, string) {
 	for _, job := range jobs {
 		switch {
 		case job.RunnerGroupName != "":
@@ -662,7 +721,7 @@ func verifyJobPlacement(jobs []apiJob, runID, group string) (bool, string) {
 				return false, fmt.Sprintf("job %q ran on runner %q in group %q, outside group %q", job.Name, job.RunnerName, job.RunnerGroupName, group)
 			}
 		case job.RunnerName != "":
-			if !isFleetRunnerName(job.RunnerName, runID, group, fleetKindReal) {
+			if !isFleetRunnerName(job.RunnerName, runID, group, kind) {
 				return false, fmt.Sprintf("job %q ran on runner %q, outside group %q", job.Name, job.RunnerName, group)
 			}
 		case job.Conclusion == "success" || job.Conclusion == "failure":
@@ -689,7 +748,9 @@ func stepsSucceeded(steps map[string]string, names ...string) bool {
 	return true
 }
 
-func verifySyntheticJobs(jobs []apiJob, shards, expectedFailures int) (bool, string) {
+// verifySyntheticJobs checks shard coverage and conclusions and, with
+// checkSteps, that each job ran its output and intentional failure steps.
+func verifySyntheticJobs(jobs []apiJob, shards, expectedFailures int, checkSteps bool) (bool, string) {
 	if len(jobs) != shards {
 		return false, fmt.Sprintf("observed %d jobs, expected %d", len(jobs), shards)
 	}
@@ -708,16 +769,16 @@ func verifySyntheticJobs(jobs []apiJob, shards, expectedFailures int) (bool, str
 		}
 		seen[shard] = struct{}{}
 		steps := stepConclusions(job)
-		if !stepsSucceeded(steps, "Synthetic work and output", "Verify synthetic output") {
+		if checkSteps && !stepsSucceeded(steps, "Synthetic work and output", "Verify synthetic output") {
 			return false, fmt.Sprintf("job %q did not produce and verify its output", job.Name)
 		}
-		intentionalFailure := steps["Intentional synthetic failure"] == "failure"
+		intentionalFailure := !checkSteps || steps["Intentional synthetic failure"] == "failure"
 		if shard < expectedFailures {
 			if job.Conclusion != "failure" || !intentionalFailure {
 				return false, fmt.Sprintf("job %q did not fail at the intentional failure step", job.Name)
 			}
 			failures++
-		} else if job.Conclusion != "success" || intentionalFailure {
+		} else if job.Conclusion != "success" || (checkSteps && intentionalFailure) {
 			return false, fmt.Sprintf("job %q had an unexpected failure", job.Name)
 		}
 	}
@@ -727,7 +788,12 @@ func verifySyntheticJobs(jobs []apiJob, shards, expectedFailures int) (bool, str
 	return true, ""
 }
 
-func verifyCIJobs(jobs []apiJob, shards, expectedFailures int) (bool, string) {
+// verifyCIJobs checks the Lint, test shard and Build jobs' conclusions and,
+// with checkSteps, their steps.
+func verifyCIJobs(jobs []apiJob, shards, expectedFailures int, checkSteps bool) (bool, string) {
+	succeeded := func(steps map[string]string, names ...string) bool {
+		return !checkSteps || stepsSucceeded(steps, names...)
+	}
 	lint, build := false, false
 	tests := make(map[int]struct{}, shards)
 	failures := 0
@@ -739,7 +805,7 @@ func verifyCIJobs(jobs []apiJob, shards, expectedFailures int) (bool, string) {
 				return false, "duplicate Lint job"
 			}
 			lint = true
-			if job.Conclusion != "success" || !stepsSucceeded(steps, "Check out repository", "Lint sources") {
+			if job.Conclusion != "success" || !succeeded(steps, "Check out repository", "Lint sources") {
 				return false, fmt.Sprintf("Lint concluded %q", job.Conclusion)
 			}
 		case job.Name == "Build":
@@ -751,7 +817,7 @@ func verifyCIJobs(jobs []apiJob, shards, expectedFailures int) (bool, string) {
 				if job.Conclusion != "skipped" {
 					return false, fmt.Sprintf("Build concluded %q after a failing test shard, expected skipped", job.Conclusion)
 				}
-			} else if job.Conclusion != "success" || !stepsSucceeded(steps, "Check out repository", "Build package", "Verify package") {
+			} else if job.Conclusion != "success" || !succeeded(steps, "Check out repository", "Build package", "Verify package") {
 				return false, fmt.Sprintf("Build concluded %q", job.Conclusion)
 			}
 		case strings.HasPrefix(job.Name, "Test shard "):
@@ -763,16 +829,16 @@ func verifyCIJobs(jobs []apiJob, shards, expectedFailures int) (bool, string) {
 				return false, fmt.Sprintf("duplicate test shard %d", shard)
 			}
 			tests[shard] = struct{}{}
-			if !stepsSucceeded(steps, "Check out repository", "Run unit tests", "Verify test report") {
+			if !succeeded(steps, "Check out repository", "Run unit tests", "Verify test report") {
 				return false, fmt.Sprintf("job %q did not pass its unit tests", job.Name)
 			}
-			intentionalFailure := steps["Intentional check failure"] == "failure"
+			intentionalFailure := !checkSteps || steps["Intentional check failure"] == "failure"
 			if shard < expectedFailures {
 				if job.Conclusion != "failure" || !intentionalFailure {
 					return false, fmt.Sprintf("job %q did not fail at the intentional check failure step", job.Name)
 				}
 				failures++
-			} else if job.Conclusion != "success" || intentionalFailure {
+			} else if job.Conclusion != "success" || (checkSteps && intentionalFailure) {
 				return false, fmt.Sprintf("job %q had an unexpected failure", job.Name)
 			}
 		default:

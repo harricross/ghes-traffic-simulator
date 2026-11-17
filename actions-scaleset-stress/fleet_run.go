@@ -64,6 +64,7 @@ func runFleet(ctx context.Context, t *target, state *runState, options runOption
 	status := startFleetStatus(t, state, groups, sessions, out)
 
 	var pools fleetPools
+	var listeners []*fakeJobListener
 	workErr := func() error {
 		var err error
 		status.setPhase("fill")
@@ -72,24 +73,27 @@ func runFleet(ctx context.Context, t *target, state *runState, options runOption
 				return err
 			}
 		}
+		if listeners, err = startFakeJobs(ctx, t, state, groups, sessions, holder, options); err != nil {
+			return err
+		}
 		if err := fillFleet(ctx, holder, sessions, state, groups, out); err != nil {
 			return err
 		}
 		status.setPhase("hold")
 		status.sampleNow(ctx)
 		return holdFleet(ctx, holder, options.dwell, func(ctx context.Context) error {
-			if budget.Real == 0 {
-				fmt.Fprintln(out, "No real runners in this fleet; no workflows are dispatched.")
+			if !budget.dispatches() {
+				fmt.Fprintln(out, "No real or fake_jobs runners in this fleet; no workflows are dispatched.")
 				return nil
 			}
-			return dispatchFleet(ctx, t, state, options, pools)
+			return dispatchFleet(ctx, t, state, options, pools, groups, sessions, listeners)
 		}, out)
 	}()
 
 	status.setPhase("teardown")
 	status.sampleNow(context.WithoutCancel(ctx))
 	status.stop()
-	teardownErr := teardownFleetRun(ctx, t, state, sessions, holder, pools, options, workErr != nil, budget, out)
+	teardownErr := teardownFleetRun(ctx, t, state, sessions, holder, pools, listeners, options, workErr != nil, budget, out)
 	tallyErr := state.update(tallyFleetWorkflows)
 	printFleetSummary(out, state.snapshot().FleetGroups)
 	return errors.Join(workErr, teardownErr, status.err(), tallyErr)
@@ -131,11 +135,105 @@ func stopFleetPools(ctx context.Context, fp fleetPools) error {
 	return errors.Join(err, fp.docker.Close())
 }
 
-// dispatchFleet sends --total workflows round-robin across the real pools at
-// --dispatch-rate once they have ramped, and waits for every run to verify.
-func dispatchFleet(ctx context.Context, t *target, state *runState, options runOptions, fp fleetPools) error {
+// dispatchFleet sends --total workflows across the real pools and fake_jobs
+// groups at --dispatch-rate once the pools have ramped, and waits for every
+// run to verify. A fake-job failure or an exited fake-job listener ends it.
+func dispatchFleet(ctx context.Context, t *target, state *runState, options runOptions, fp fleetPools,
+	groups []fleetGroup, sessions *sessionManager, listeners []*fakeJobListener) error {
 	interval := time.Duration(float64(time.Second) / options.dispatchRate)
-	return dispatchAndObserve(ctx, t, state, options, fp.pools, interval)
+	targets := append(poolTargets(fp.pools), fakeJobTargets(groups)...)
+	dispatchCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	go watchFakeJobs(dispatchCtx, cancel, sessions, listeners)
+	err := dispatchAndObserve(dispatchCtx, t, state, options, fp.pools, targets, interval)
+	if cause := context.Cause(dispatchCtx); ctx.Err() == nil && cause != nil && !errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	return err
+}
+
+func fakeJobTargets(groups []fleetGroup) []dispatchTarget {
+	var targets []dispatchTarget
+	for _, g := range groups {
+		if g.Spec.FakeJobs && g.Fake.ID > 0 {
+			targets = append(targets, dispatchTarget{Group: g.Name, Label: g.Fake.Name, FakeJobs: true})
+		}
+	}
+	return targets
+}
+
+// watchFakeJobs cancels ctx with the first fake-job failure or when a
+// fake-job listener exits before it is stopped.
+func watchFakeJobs(ctx context.Context, cancel context.CancelCauseFunc, sessions *sessionManager, listeners []*fakeJobListener) {
+	exited := make(chan string, len(listeners))
+	for _, l := range listeners {
+		go func() {
+			select {
+			case <-l.exited:
+				exited <- l.Group
+			case <-ctx.Done():
+			}
+		}()
+	}
+	select {
+	case err := <-sessions.fatalErrors():
+		cancel(err)
+	case group := <-exited:
+		cancel(groupError(group, errors.New("fake scale-set listener exited unexpectedly")))
+	case <-ctx.Done():
+	}
+}
+
+// startFakeJobs starts a job listener for each fake_jobs group's fake scale
+// set and makes the group's fake-online runners run the jobs they are
+// assigned, each replaced by a fresh registration once its job completes.
+// Replacement names continue after the fill's indexes.
+func startFakeJobs(ctx context.Context, t *target, state *runState, groups []fleetGroup, sessions *sessionManager,
+	holder *holder, options runOptions) ([]*fakeJobListener, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return nil, fmt.Errorf("get listener owner name: %w", err)
+	}
+	runID := state.data.RunID
+	var listeners []*fakeJobListener
+	for _, g := range groups {
+		if !g.Spec.FakeJobs || g.Fake.ID == 0 {
+			continue
+		}
+		target := holdTarget{Group: g.Name, ScaleSetID: g.Fake.ID, Count: 1}
+		next := new(atomic.Int64)
+		next.Store(int64(g.Spec.Online + g.Spec.Offline))
+		nextName := func() string {
+			return fleetRunnerName(runID, target.Group, fleetKindFake, int(next.Add(1)-1))
+		}
+		sessions.setFakeJobs(g.Name, &fakeJobConfig{
+			duration: options.fakeJobDuration,
+			replace: func(jobCtx context.Context, finished string) error {
+				holder.consume(finished)
+				if ctx.Err() != nil {
+					return errReplacementSkipped
+				}
+				replaceCtx, cancel := context.WithCancel(jobCtx)
+				defer cancel()
+				defer context.AfterFunc(ctx, cancel)()
+				id, name, jit, err := holder.registerReplacement(replaceCtx, target, nextName)
+				if err != nil {
+					if ctx.Err() != nil {
+						return errReplacementSkipped
+					}
+					return err
+				}
+				sessions.add(jobCtx, target.Group, id, name, jit)
+				return nil
+			},
+		})
+		l, err := startFakeJobListener(ctx, t.scaleSet, g.Fake.ID, g.Spec.Online, hostname+"-"+runID+"-"+g.Name+"-fake", g.Name)
+		if err != nil {
+			return listeners, err
+		}
+		listeners = append(listeners, l)
+	}
+	return listeners, nil
 }
 
 func firstFleetScaleSet(groups []fleetGroup) int {
@@ -157,7 +255,11 @@ func printFleetPlan(w io.Writer, groups []fleetGroup, b fleetBudget) {
 		if g.Reused {
 			origin = fmt.Sprintf("reused, %d existing runners", g.Existing)
 		}
-		fmt.Fprintf(w, "  %s (id %d, %s): real %d, online %d, offline %d\n", g.Name, g.ID, origin, g.Spec.Real, g.Spec.Online, g.Spec.Offline)
+		fakeJobs := ""
+		if g.Spec.FakeJobs {
+			fakeJobs = ", fake_jobs"
+		}
+		fmt.Fprintf(w, "  %s (id %d, %s): real %d, online %d, offline %d%s\n", g.Name, g.ID, origin, g.Spec.Real, g.Spec.Online, g.Spec.Offline, fakeJobs)
 	}
 }
 
@@ -263,18 +365,21 @@ func holdFleet(ctx context.Context, holder *holder, dwell time.Duration, work fu
 	return nil
 }
 
-// teardownFleetRun stops workflows, sessions, fake registrations and real
-// pools in that order. It ignores ctx cancellation (the run deadline). Each
-// phase has its own deadline, so a long fake removal at --rate cannot
-// exhaust the time left to stop the real pools.
+// teardownFleetRun stops workflows, fake-job listeners, sessions, fake
+// registrations and real pools in that order. It ignores ctx cancellation
+// (the run deadline). Each phase has its own deadline, so a long fake
+// removal at --rate cannot exhaust the time left to stop the real pools.
 func teardownFleetRun(ctx context.Context, t *target, state *runState, sessions *sessionManager, holder *holder,
-	pools fleetPools, options runOptions, failed bool, budget fleetBudget, out io.Writer) error {
+	pools fleetPools, listeners []*fakeJobListener, options runOptions, failed bool, budget fleetBudget, out io.Writer) error {
 	detached := context.WithoutCancel(ctx)
 	var errs []error
 	if failed && !allWorkflowsTerminal(state.snapshot().Workflows) {
 		drainCtx, drainCancel := context.WithTimeout(detached, options.drainTimeout)
 		errs = append(errs, cancelActiveWorkflows(drainCtx, t, state, options.drainTimeout))
 		drainCancel()
+	}
+	for _, l := range listeners {
+		errs = append(errs, l.stop())
 	}
 	closeCtx, closeCancel := context.WithTimeout(detached, 5*time.Minute+secondsAt(budget.Online, float64(max(options.openConcurrency, 1))*5))
 	errs = append(errs, sessions.closeAll(closeCtx))

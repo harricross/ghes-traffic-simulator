@@ -34,6 +34,7 @@ const (
 	holdMaxConsecutiveFailures = 20
 	holdMissingJournalLimit    = 50
 	holdRemoveAttempts         = 3
+	holdReplaceAttempts        = 3
 	holdCallTimeout            = 30 * time.Second
 	holdSampleWorkers          = 8
 	holdCleanupWorkers         = 16
@@ -54,6 +55,9 @@ type heldRunner struct {
 	pos     int // index into runData.Runners
 	created time.Time
 	gone    bool
+	// consumed marks a fake runner that ran a job; GHES deletes such
+	// ephemeral runners itself.
+	consumed bool
 }
 
 // fatalHoldError marks failures of the run's own bookkeeping, which must stop
@@ -81,6 +85,10 @@ type holder struct {
 	runners []heldRunner
 	started time.Time
 	missing int
+
+	// replaceMu paces replacement registrations at rate.
+	replaceMu   sync.Mutex
+	nextReplace time.Time
 }
 
 func newHolder(api runnerAPI, state *runState, scaleSetID, workers int, rate float64, out io.Writer) *holder {
@@ -498,6 +506,65 @@ func (h *holder) reconcileRegistration(ctx context.Context, target holdTarget, n
 	}
 }
 
+// consume marks the named runner as having run a fake job, so sampling no
+// longer expects it. Removal still tries it and tolerates its absence.
+func (h *holder) consume(name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := len(h.runners) - 1; i >= 0; i-- {
+		if h.runners[i].name == name {
+			h.runners[i].consumed = true
+			return
+		}
+	}
+}
+
+// waitReplaceSlot spaces replacement registrations 1/rate apart.
+func (h *holder) waitReplaceSlot(ctx context.Context) error {
+	interval := time.Duration(float64(time.Second) / h.rate)
+	h.replaceMu.Lock()
+	slot := h.nextReplace
+	if now := time.Now(); slot.Before(now) {
+		slot = now
+	}
+	h.nextReplace = slot.Add(interval)
+	h.replaceMu.Unlock()
+	if wait := time.Until(slot); wait > 0 {
+		sleepCtx(ctx, wait)
+	}
+	return ctx.Err()
+}
+
+// registerReplacement registers one runner into target, taking a fresh name
+// from nextName for each of up to holdReplaceAttempts attempts, and returns
+// its ID, name and encoded JIT config.
+func (h *holder) registerReplacement(ctx context.Context, target holdTarget, nextName func() string) (int, string, string, error) {
+	var last error
+	for attempt := 0; attempt < holdReplaceAttempts; attempt++ {
+		if attempt > 0 {
+			// GHES may not have deleted the finished runner yet, leaving
+			// the group briefly full.
+			sleepCtx(ctx, time.Duration(attempt)*2*time.Second)
+		}
+		if err := h.waitReplaceSlot(ctx); err != nil {
+			return 0, "", "", err
+		}
+		name := nextName()
+		id, encodedJIT, err := h.registerOne(ctx, target, name)
+		var fatalErr fatalHoldError
+		switch {
+		case err == nil:
+			return id, name, encodedJIT, nil
+		case errors.As(err, &fatalErr):
+			return 0, "", "", err
+		case ctx.Err() != nil:
+			return 0, "", "", ctx.Err()
+		}
+		last = err
+	}
+	return 0, "", "", fmt.Errorf("%d replacement registrations failed; last: %s", holdReplaceAttempts, safeError(last))
+}
+
 func (h *holder) track(id int, name string, scaleSetID int) error {
 	now := time.Now().UTC()
 	pos := -1
@@ -555,6 +622,7 @@ func (h *holder) missingCount() int {
 }
 
 // pick returns up to n distinct random runners that are not known gone.
+// With onlyPresent it also skips consumed runners, which GHES deletes.
 func (h *holder) pick(n int, onlyPresent bool) []int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -562,17 +630,18 @@ func (h *holder) pick(n int, onlyPresent bool) []int {
 	if total == 0 {
 		return nil
 	}
+	present := func(i int) bool { return !onlyPresent || (!h.runners[i].gone && !h.runners[i].consumed) }
 	chosen := make(map[int]struct{}, n)
 	if total <= n {
 		for i := range h.runners {
-			if !onlyPresent || !h.runners[i].gone {
+			if present(i) {
 				chosen[i] = struct{}{}
 			}
 		}
 	} else {
 		for attempts := 0; len(chosen) < n && attempts < n*4; attempts++ {
 			i := rand.IntN(total)
-			if !onlyPresent || !h.runners[i].gone {
+			if present(i) {
 				chosen[i] = struct{}{}
 			}
 		}

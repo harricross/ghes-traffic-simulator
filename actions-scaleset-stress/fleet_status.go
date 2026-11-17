@@ -28,7 +28,7 @@ func newFleetResults(groups []fleetGroup) []fleetGroupResult {
 	for i, g := range groups {
 		results[i] = fleetGroupResult{
 			Name: g.Name, ID: g.ID, Created: !g.Reused, ExistingRunners: g.Existing,
-			Real: g.Spec.Real, Online: g.Spec.Online, Offline: g.Spec.Offline,
+			Real: g.Spec.Real, Online: g.Spec.Online, Offline: g.Spec.Offline, FakeJobs: g.Spec.FakeJobs,
 		}
 	}
 	return results
@@ -83,6 +83,9 @@ func (r *fleetGroupResult) note(s fleetSample) {
 	r.Polls = s.Sessions.Polls
 	r.PollErrors = s.Sessions.PollErrors
 	r.UnexpectedMessages = s.Sessions.Unexpected
+	r.JobsReceived, r.JobsSucceeded, r.JobsFailed = s.Sessions.JobsReceived, s.Sessions.JobsSucceeded, s.Sessions.JobsFailed
+	r.JobsCanceled, r.JobErrors = s.Sessions.JobsCanceled, s.Sessions.JobErrors
+	r.Replacements, r.ReplaceErrors = s.Sessions.Replacements, s.Sessions.ReplaceErrors
 	if len(s.Sessions.UnexpectedTypes) > 0 {
 		r.UnexpectedTypes = maps.Clone(s.Sessions.UnexpectedTypes)
 	}
@@ -117,6 +120,11 @@ func formatFleetSample(g fleetGroup, s fleetSample) string {
 		fmt.Fprintf(&b, " sessions open %d/%d (failed %d), polls %d, poll errors %d, unexpected messages %d",
 			s.Sessions.Open, g.Spec.Online, s.Sessions.OpenFailed, s.Sessions.Polls, s.Sessions.PollErrors, s.Sessions.Unexpected)
 	}
+	if g.Spec.FakeJobs {
+		fmt.Fprintf(&b, "; fake jobs %d received, %d succeeded, %d failed, %d canceled, %d errors; replacements %d (errors %d)",
+			s.Sessions.JobsReceived, s.Sessions.JobsSucceeded, s.Sessions.JobsFailed, s.Sessions.JobsCanceled,
+			s.Sessions.JobErrors, s.Sessions.Replacements, s.Sessions.ReplaceErrors)
+	}
 	return strings.TrimSuffix(b.String(), ";")
 }
 
@@ -131,6 +139,15 @@ func recordFleetStatus(ctx context.Context, sets scaleSetAPI, groups groupAPI, o
 			"phase": phase, "runner_group": g.Name, "group_runners": s.GroupRunners,
 			"sessions_open": s.Sessions.Open, "polls": s.Sessions.Polls,
 			"poll_errors": s.Sessions.PollErrors, "unexpected_messages": s.Sessions.Unexpected,
+		}
+		if g.Spec.FakeJobs {
+			fields["fake_jobs_received"] = s.Sessions.JobsReceived
+			fields["fake_jobs_succeeded"] = s.Sessions.JobsSucceeded
+			fields["fake_jobs_failed"] = s.Sessions.JobsFailed
+			fields["fake_jobs_canceled"] = s.Sessions.JobsCanceled
+			fields["fake_job_errors"] = s.Sessions.JobErrors
+			fields["fake_runner_replacements"] = s.Sessions.Replacements
+			fields["fake_runner_replace_errors"] = s.Sessions.ReplaceErrors
 		}
 		for kind, st := range map[string]*scaleset.RunnerScaleSetStatistic{scaleSetReal: s.Real, scaleSetFake: s.Fake} {
 			if st != nil {
@@ -205,6 +222,10 @@ func printFleetSummary(w io.Writer, results []fleetGroupResult) {
 				r.Dispatched, r.Passed, r.IntentionalFails, r.Failed, r.Unresolved)
 		}
 		fmt.Fprintf(w, "; unexpected messages %d", r.UnexpectedMessages)
+		if r.FakeJobs {
+			fmt.Fprintf(w, "; fake jobs %d received, %d succeeded, %d failed, %d canceled, %d errors; replacements %d (errors %d)",
+				r.JobsReceived, r.JobsSucceeded, r.JobsFailed, r.JobsCanceled, r.JobErrors, r.Replacements, r.ReplaceErrors)
+		}
 		if r.CeilingReason != "" {
 			fmt.Fprintf(w, "; stopped growing: %s", r.CeilingReason)
 		}

@@ -62,9 +62,11 @@ type workflowRecord struct {
 	ExpectedFailures int       `json:"expected_failures"`
 	CompletedSeenAt  time.Time `json:"completed_seen_at,omitzero"`
 	// RunnerLabel and Group are set for fleet dispatches, which target one
-	// runner group's real scale set; jobs must run on that group's runners.
+	// runner group's real scale set, or its fake scale set when FakeJobs;
+	// jobs must run on that group's runners of that kind.
 	RunnerLabel string `json:"runner_label,omitempty"`
 	Group       string `json:"group,omitempty"`
+	FakeJobs    bool   `json:"fake_jobs,omitempty"`
 	// Outcome is the verified result once completed: workflowPassed,
 	// workflowIntentionalFailure or workflowFailed.
 	Outcome string `json:"outcome,omitempty"`
@@ -95,6 +97,14 @@ type fleetGroupResult struct {
 	PollErrors         int64            `json:"poll_errors,omitempty"`
 	UnexpectedMessages int64            `json:"unexpected_messages"`
 	UnexpectedTypes    map[string]int64 `json:"unexpected_message_types,omitempty"`
+	FakeJobs           bool             `json:"fake_jobs,omitempty"`
+	JobsReceived       int64            `json:"fake_jobs_received,omitempty"`
+	JobsSucceeded      int64            `json:"fake_jobs_succeeded,omitempty"`
+	JobsFailed         int64            `json:"fake_jobs_failed,omitempty"`
+	JobsCanceled       int64            `json:"fake_jobs_canceled,omitempty"`
+	JobErrors          int64            `json:"fake_job_errors,omitempty"`
+	Replacements       int64            `json:"fake_runner_replacements,omitempty"`
+	ReplaceErrors      int64            `json:"fake_runner_replace_errors,omitempty"`
 	PeakRealRegistered int              `json:"peak_real_registered"`
 	PeakRealBusy       int              `json:"peak_real_busy"`
 	PeakFakeRegistered int              `json:"peak_fake_registered"`

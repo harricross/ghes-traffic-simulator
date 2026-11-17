@@ -26,14 +26,15 @@ func TestFleetSpecValidation(t *testing.T) {
 		spec fleetSpec
 		want string
 	}{
-		"no groups":     {fleetSpec{}, "between 1 and 20"},
-		"bad prefix":    {fleetSpec{GroupPrefix: "Stress", Groups: ok.Groups}, "group_prefix"},
-		"bad name":      {fleetSpec{Groups: []fleetGroupSpec{{Name: "g 1", Real: 1}}}, "lowercase"},
-		"duplicate":     {fleetSpec{Groups: []fleetGroupSpec{{Name: "a", Real: 1}, {Name: "a", Online: 1}}}, "more than once"},
-		"negative":      {fleetSpec{Groups: []fleetGroupSpec{{Name: "a", Real: 2, Online: -1}}}, "negative"},
-		"empty group":   {fleetSpec{Groups: []fleetGroupSpec{{Name: "a"}}}, "at least one runner"},
-		"over limit":    {fleetSpec{Groups: []fleetGroupSpec{{Name: "a", Online: 5000, Offline: 5001}}}, "at most 10000"},
-		"long set name": {fleetSpec{GroupPrefix: "abcdefghijklmnop", Groups: []fleetGroupSpec{{Name: "abcdefghijklmnop", Real: 1}}}, "longer than 40"},
+		"no groups":         {fleetSpec{}, "between 1 and 20"},
+		"bad prefix":        {fleetSpec{GroupPrefix: "Stress", Groups: ok.Groups}, "group_prefix"},
+		"bad name":          {fleetSpec{Groups: []fleetGroupSpec{{Name: "g 1", Real: 1}}}, "lowercase"},
+		"duplicate":         {fleetSpec{Groups: []fleetGroupSpec{{Name: "a", Real: 1}, {Name: "a", Online: 1}}}, "more than once"},
+		"negative":          {fleetSpec{Groups: []fleetGroupSpec{{Name: "a", Real: 2, Online: -1}}}, "negative"},
+		"empty group":       {fleetSpec{Groups: []fleetGroupSpec{{Name: "a"}}}, "at least one runner"},
+		"over limit":        {fleetSpec{Groups: []fleetGroupSpec{{Name: "a", Online: 5000, Offline: 5001}}}, "at most 10000"},
+		"long set name":     {fleetSpec{GroupPrefix: "abcdefghijklmnop", Groups: []fleetGroupSpec{{Name: "abcdefghijklmnop", Real: 1}}}, "longer than 40"},
+		"fake jobs offline": {fleetSpec{Groups: []fleetGroupSpec{{Name: "a", Real: 1, Offline: 5, FakeJobs: true}}}, "fake_jobs"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -86,6 +87,10 @@ func TestFleetBudget(t *testing.T) {
 	if fake := (fleetSpec{Groups: []fleetGroupSpec{{Name: "a", Offline: 1}}}).budget(25, 5, 1, 60, 0); fake.Dispatch != 0 {
 		t.Fatalf("fake-only fleet budgets %s for dispatches", fake.Dispatch)
 	}
+	jobs := (fleetSpec{Groups: []fleetGroupSpec{{Name: "a", Online: 10, FakeJobs: true}}}).budget(25, 5, 1, 60, 0)
+	if !jobs.dispatches() || jobs.FakeJobGroups != 1 || jobs.Dispatch != time.Minute {
+		t.Fatalf("fake_jobs fleet must budget dispatches: %+v", jobs)
+	}
 }
 
 func TestFleetCleanupTimeoutAndFileLimit(t *testing.T) {
@@ -121,6 +126,8 @@ func TestFleetBudgetCheck(t *testing.T) {
 		"too many runs": {ok, runOptions{total: 101, maxRunners: 20, duration: time.Hour}, cfg, "100 workflow dispatches"},
 		"max runners":   {fleetBudget{Real: 21}, o, cfg, "--max-runners is 20"},
 		"short":         {fleetBudget{Fake: 1, MinDuration: time.Hour + time.Second}, o, cfg, "needs at least 1h0m1s"},
+		"fake split":    {fleetBudget{Online: 5, FakeJobGroups: 1}, runOptions{total: 10, maxRunners: 20, duration: time.Hour, fakeJobPercent: 50}, config{}, "--fake-job-percent must be 100"},
+		"fake dispatch": {fleetBudget{Online: 5, FakeJobGroups: 1}, runOptions{total: 101, maxRunners: 20, duration: time.Hour, fakeJobPercent: 100}, config{}, "100 workflow dispatches"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

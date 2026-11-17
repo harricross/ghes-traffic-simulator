@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -55,11 +56,15 @@ func encodeTestJIT(t *testing.T, serverURL, clientID string, agentID int) string
 	})
 }
 
+const testPoolPath = "/_services/pipelines/SECRETtoken/_apis/distributedtask/pools/1/"
+
 // fakeSessionServer implements the token, session and message endpoints a
 // fake runner may use. Any other request, such as acquiring a job or
-// deleting a message, is recorded as unknown.
+// deleting a message, is recorded as unknown unless handle serves it.
 type fakeSessionServer struct {
 	srv *httptest.Server
+	// handle, when set, may serve a request first and report true.
+	handle func(w http.ResponseWriter, r *http.Request) bool
 
 	mu              sync.Mutex
 	issued          map[string]int    // tokens issued per client
@@ -67,7 +72,9 @@ type fakeSessionServer struct {
 	sessions        map[string]string // open session -> client
 	deletes         map[string]int
 	polls           map[string]int
-	message         map[string]string // client -> message type delivered once
+	message         map[string]string         // client -> message type delivered once
+	rawMessage      map[string]map[string]any // client -> whole message delivered once
+	sessionKey      []byte                    // returned RSA-encrypted when set
 	revokeFirstPoll map[string]bool
 	unknown         []string
 }
@@ -75,17 +82,29 @@ type fakeSessionServer struct {
 func newFakeSessionServer(t *testing.T) *fakeSessionServer {
 	f := &fakeSessionServer{
 		issued: map[string]int{}, tokens: map[string]string{}, sessions: map[string]string{},
-		deletes: map[string]int{}, polls: map[string]int{}, message: map[string]string{}, revokeFirstPoll: map[string]bool{},
+		deletes: map[string]int{}, polls: map[string]int{}, message: map[string]string{},
+		rawMessage: map[string]map[string]any{}, revokeFirstPoll: map[string]bool{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
 }
 
+// client returns the runner a request's OAuth bearer token was issued to.
+func (f *fakeSessionServer) client(r *http.Request) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	client, ok := f.tokens[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
+	return client, ok
+}
+
 func (f *fakeSessionServer) serve(w http.ResponseWriter, r *http.Request) {
-	const pool = "/_services/pipelines/SECRETtoken/_apis/distributedtask/pools/1/"
+	const pool = testPoolPath
 	if r.Method == http.MethodPost && r.URL.Path == "/oauth/token" {
 		f.issueToken(w, r)
+		return
+	}
+	if f.handle != nil && f.handle(w, r) {
 		return
 	}
 	f.mu.Lock()
@@ -101,7 +120,16 @@ func (f *fakeSessionServer) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == pool+"sessions":
 		id := "sess-" + client
 		f.sessions[id] = client
-		_ = json.NewEncoder(w).Encode(map[string]string{"sessionId": id})
+		resp := map[string]any{"sessionId": id}
+		if f.sessionKey != nil {
+			encrypted, err := rsa.EncryptOAEP(sha1.New(), rand.Reader, &testRunnerKey().PublicKey, f.sessionKey, nil)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			resp["encryptionKey"] = map[string]any{"encrypted": true, "value": encrypted}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	case r.Method == http.MethodGet && r.URL.Path == pool+"messages":
 		if f.sessions[r.URL.Query().Get("sessionId")] != client {
 			w.WriteHeader(http.StatusNotFound)
@@ -111,6 +139,11 @@ func (f *fakeSessionServer) serve(w http.ResponseWriter, r *http.Request) {
 		if f.revokeFirstPoll[client] && f.polls[client] == 1 {
 			delete(f.tokens, token)
 			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if msg := f.rawMessage[client]; msg != nil {
+			delete(f.rawMessage, client)
+			_ = json.NewEncoder(w).Encode(msg)
 			return
 		}
 		if msgType := f.message[client]; msgType != "" {

@@ -119,3 +119,33 @@ func TestHoldFleetEndsEarlyOnWorkErrorOrCancellation(t *testing.T) {
 		t.Fatalf("err = %v, work stopped %v", err, workStopped)
 	}
 }
+
+func TestWatchFakeJobsCancelsOnFatalErrorOrListenerExit(t *testing.T) {
+	sessions := newSessionManager(http.DefaultClient, 1, "2.338.0", &syncBuffer{})
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	go watchFakeJobs(ctx, cancel, sessions, nil)
+	sessions.reportFatal(errors.New("job rejected"))
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("a fake-job failure must cancel dispatch")
+	}
+	if cause := context.Cause(ctx); cause == nil || cause.Error() != "job rejected" {
+		t.Fatalf("cause = %v", cause)
+	}
+
+	listener := &fakeJobListener{Group: "stress-g01", exited: make(chan struct{})}
+	ctx, cancel = context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	go watchFakeJobs(ctx, cancel, newSessionManager(http.DefaultClient, 1, "2.338.0", &syncBuffer{}), []*fakeJobListener{listener})
+	close(listener.exited)
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("a listener exit must cancel dispatch")
+	}
+	if cause := context.Cause(ctx); cause == nil || !strings.Contains(cause.Error(), "stress-g01") || !strings.Contains(cause.Error(), "exited") {
+		t.Fatalf("cause = %v", cause)
+	}
+}
