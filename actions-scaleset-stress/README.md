@@ -73,16 +73,17 @@ the named environment variable; do not put it in the JSON file or command
 line. The image reference is required only for workflow mode and must use an
 immutable SHA-256 digest.
 
-## Prebuilt Linux binaries
+## Prebuilt binaries
 
 The `actions-scaleset-stress` workflow runs gofmt, `go vet` and the race
-tests on pull requests and pushes to `main` that change the tool. Each such
-push to `main` replaces the `actions-scaleset-stress/edge` prerelease with
-`linux_amd64` and `linux_arm64` archives and `checksums.txt`. Pushing a tag
-such as `actions-scaleset-stress/v0.1.0` publishes a versioned release; a
-tag with a hyphen (`v0.2.0-rc.1`) is published as a prerelease.
+tests on pull requests that change the tool and on every push to `main`.
+Every push to `main` replaces the `actions-scaleset-stress/edge` prerelease
+with Linux and Darwin (macOS) archives for amd64 and arm64, plus
+`checksums.txt`. Pushing a tag such as `v0.1.0` (or
+`actions-scaleset-stress/v0.1.0`) publishes a versioned release; a version
+with a prerelease suffix (`v0.2.0-rc.1`) is published as a prerelease.
 
-To run a release build through the wrapper, from the repository root:
+To run a Linux amd64 release build through the wrapper, from the repository root:
 
 ```bash
 tag=actions-scaleset-stress/edge   # or a versioned tag

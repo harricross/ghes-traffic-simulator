@@ -8,11 +8,7 @@ on:
       - ".github/workflows/actions-scaleset-stress.yml"
   push:
     branches: [main]
-    tags: ["actions-scaleset-stress/v*"]
-    paths:
-      - "actions-scaleset-stress/**"
-      - "actions-scaleset-stress.sh"
-      - ".github/workflows/actions-scaleset-stress.yml"
+    tags: ["v*", "actions-scaleset-stress/v*"]
 
 permissions:
   contents: read
@@ -56,28 +52,31 @@ jobs:
         with:
           go-version-file: actions-scaleset-stress/go.mod
           cache-dependency-path: actions-scaleset-stress/go.sum
-      - name: Build Linux binaries
+      - name: Build release binaries
         run: |
           case "$GITHUB_REF" in
             refs/tags/actions-scaleset-stress/v*) version="${GITHUB_REF#refs/tags/actions-scaleset-stress/}" ;;
+            refs/tags/v*) version="${GITHUB_REF#refs/tags/}" ;;
             refs/heads/main) version="edge-${GITHUB_SHA::7}" ;;
             *) version="dev-${GITHUB_SHA::7}" ;;
           esac
           dist="$GITHUB_WORKSPACE/dist"
-          for arch in amd64 arm64; do
-            out="$RUNNER_TEMP/build/$arch"
-            mkdir -p "$out"
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
-              -ldflags "-s -w -X main.version=$version" -o "$out/actions-scaleset-stress" .
-            mkdir -p "$dist"
-            tar -C "$out" -czf "$dist/actions-scaleset-stress_${version}_linux_${arch}.tar.gz" actions-scaleset-stress
+          mkdir -p "$dist"
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              out="$RUNNER_TEMP/build/$os/$arch"
+              mkdir -p "$out"
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
+                -ldflags "-s -w -X main.version=$version" -o "$out/actions-scaleset-stress" .
+              tar -C "$out" -czf "$dist/actions-scaleset-stress_${version}_${os}_${arch}.tar.gz" actions-scaleset-stress
+            done
           done
           (cd "$dist" && sha256sum ./*.tar.gz > checksums.txt)
-          got=$("$RUNNER_TEMP/build/amd64/actions-scaleset-stress" version)
+          got=$("$RUNNER_TEMP/build/linux/amd64/actions-scaleset-stress" version)
           [[ "$got" == "actions-scaleset-stress $version" ]] || { echo "::error::version printed '$got'"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: linux-binaries
+          name: release-binaries
           path: dist/
           if-no-files-found: error
           retention-days: 7
@@ -100,17 +99,18 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: linux-binaries
+          name: release-binaries
           path: dist
       - name: Publish versioned release
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           tag="${GITHUB_REF#refs/tags/}"
-          args=(--verify-tag --title "actions-scaleset-stress ${tag#actions-scaleset-stress/}" --generate-notes)
+          version="${tag#actions-scaleset-stress/}"
+          args=(--verify-tag --title "actions-scaleset-stress $version" --generate-notes)
           prev=$(gh release list --exclude-pre-releases --limit 100 --json tagName \
-            --jq '[.[].tagName | select(startswith("actions-scaleset-stress/v"))][0] // empty')
+            --jq '[.[].tagName | select(startswith("actions-scaleset-stress/v") or startswith("v"))][0] // empty')
           if [[ -n "$prev" ]]; then args+=(--notes-start-tag "$prev"); fi
-          if [[ "$tag" == *-* ]]; then args+=(--prerelease); fi
+          if [[ "$version" == *-* ]]; then args+=(--prerelease); fi
           gh release create "$tag" dist/* "${args[@]}"
       - name: Replace edge prerelease
         if: github.ref == 'refs/heads/main'
@@ -124,4 +124,4 @@ jobs:
           fi
           gh release create "$tag" dist/* --target "$GITHUB_SHA" --prerelease \
             --title "actions-scaleset-stress edge (${GITHUB_SHA::7})" \
-            --notes "Rolling Linux build of main at $GITHUB_SHA. Replaced on every push to main that changes the tool."
+            --notes "Rolling Linux and Darwin build of main at $GITHUB_SHA. Replaced on every push to main."
