@@ -14,8 +14,11 @@ import (
 )
 
 func runWorkload(ctx context.Context, t *target, state *runState, options runOptions) error {
-	if options.mode == "registrations" {
+	switch options.mode {
+	case "registrations":
 		return runRegistrationChurn(ctx, t, state, options)
+	case modeHold:
+		return runRegistrationHold(ctx, t, state, options)
 	}
 	return runWorkflowLoad(ctx, t, state, options)
 }

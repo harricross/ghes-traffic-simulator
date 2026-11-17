@@ -25,6 +25,12 @@ func cleanupRun(ctx context.Context, t *target, state *runState) error {
 		}
 	}
 
+	if state.snapshot().Mode == modeHold {
+		if err := cleanupHeldRunners(ctx, t, state); err != nil {
+			failures = append(failures, err)
+		}
+	}
+
 	for _, runner := range state.snapshot().Runners {
 		if runner.Removed {
 			continue

@@ -6,6 +6,9 @@ disposable runner scale sets. It has two profiles:
 
 - `registrations` repeatedly creates just-in-time runner registrations and
   removes them after a configurable dwell.
+- `hold` bulk-registers tens of thousands of registered-only runners, holds
+  them for hours, then removes them all; see [Holding registered-only
+  runners at scale](#holding-registered-only-runners-at-scale).
 - `workflows` dispatches workflows and runs them on digest-pinned,
   operator-supplied Actions runner containers. The `synthetic` workload is a
   matrix that produces and verifies bounded output; the `ci` workload runs a
@@ -206,6 +209,42 @@ If a run is interrupted, inspect its report and use cleanup with the same
 configuration and run ID. Cleanup may report unresolved remote state; do not
 repeat load until the scale set, runners, active workflow runs, and containers
 have been reconciled.
+
+### Holding registered-only runners at scale
+
+`--mode hold` is for filling the GHES database with runner rows rather than
+running jobs. Each runner is one JIT registration (one API call, no container),
+so a single small host can hold tens of thousands:
+
+```bash
+./actions-scaleset-stress.sh run \
+  --config actions-scaleset-stress.json \
+  --mode hold \
+  --total 10000 --rate 50 --max-inflight 32 \
+  --dwell 30m --duration 2h
+```
+
+- `--total` (up to 100000) registrations are created at up to `--rate` per
+  second with `--max-inflight` concurrent API calls. After 20 consecutive
+  registration failures the run stops growing, holds what it has, and records
+  the stopping point in `scale.ceiling_runners`/`scale.ceiling_reason`.
+- `--dwell` (up to 24h) is the hold time; `--duration` must exceed it. Every
+  minute a random sample of 50 registrations is checked, and a final sample of
+  500 runs before removal. Registrations GHES drops on its own are counted in
+  `held_missing`, the first 50 are journaled as `runner_missing_during_hold`,
+  and `first_missing_after_seconds` records how old the first one was. This
+  tells you whether GHES garbage-collects runners that never connect.
+- Removal is bulk and paced, retries each runner, never removes a runner whose
+  name does not belong to the run, and spot-checks that removed runners are
+  gone. `cleanup --apply` uses the same path and verifies each journaled
+  runner ID still has its journaled name.
+- To keep a 100000-runner run practical, `state.json` is written at most every
+  two seconds (the journal is still synced per event). If the process is
+  killed, `cleanup` rebuilds the runner list from the journal.
+
+These runners are registrations only; they never appear online and cannot run
+jobs. Watch the appliance separately, for example database size and load, while
+they are held.
 
 ## Validation
 

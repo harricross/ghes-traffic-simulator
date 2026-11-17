@@ -80,22 +80,25 @@ type runData struct {
 // provisioning stopped growing. Registered counts are GHES-reported
 // (scale-set statistics); containers are runners this tool started.
 type scaleResults struct {
-	StandingTarget   int       `json:"standing_target,omitempty"`
-	PeakContainers   int       `json:"peak_containers,omitempty"`
-	PeakRegistered   int       `json:"peak_registered,omitempty"`
-	PeakIdle         int       `json:"peak_idle,omitempty"`
-	PeakBusy         int       `json:"peak_busy,omitempty"`
-	PeakAssignedJobs int       `json:"peak_assigned_jobs,omitempty"`
-	PeakRunningJobs  int       `json:"peak_running_jobs,omitempty"`
-	PeakHeld         int       `json:"peak_held_registrations,omitempty"`
-	HeldVerified     int       `json:"held_verified,omitempty"`
-	HeldMissing      int       `json:"held_missing,omitempty"`
-	ContainerExits   int       `json:"unexpected_container_exits,omitempty"`
-	ProvisionErrors  int       `json:"provision_errors,omitempty"`
-	CeilingRunners   int       `json:"ceiling_runners,omitempty"`
-	CeilingReason    string    `json:"ceiling_reason,omitempty"`
-	RampStartedAt    time.Time `json:"ramp_started_at,omitzero"`
-	RampFinishedAt   time.Time `json:"ramp_finished_at,omitzero"`
+	StandingTarget   int `json:"standing_target,omitempty"`
+	PeakContainers   int `json:"peak_containers,omitempty"`
+	PeakRegistered   int `json:"peak_registered,omitempty"`
+	PeakIdle         int `json:"peak_idle,omitempty"`
+	PeakBusy         int `json:"peak_busy,omitempty"`
+	PeakAssignedJobs int `json:"peak_assigned_jobs,omitempty"`
+	PeakRunningJobs  int `json:"peak_running_jobs,omitempty"`
+	PeakHeld         int `json:"peak_held_registrations,omitempty"`
+	HeldVerified     int `json:"held_verified,omitempty"`
+	HeldMissing      int `json:"held_missing,omitempty"`
+	// FirstMissingAfterSeconds is the age of the first held registration
+	// GHES dropped before this run removed it.
+	FirstMissingAfterSeconds int       `json:"first_missing_after_seconds,omitempty"`
+	ContainerExits           int       `json:"unexpected_container_exits,omitempty"`
+	ProvisionErrors          int       `json:"provision_errors,omitempty"`
+	CeilingRunners           int       `json:"ceiling_runners,omitempty"`
+	CeilingReason            string    `json:"ceiling_reason,omitempty"`
+	RampStartedAt            time.Time `json:"ramp_started_at,omitzero"`
+	RampFinishedAt           time.Time `json:"ramp_finished_at,omitzero"`
 }
 
 type runState struct {
@@ -103,6 +106,42 @@ type runState struct {
 	dir  string
 	data runData
 	log  *os.File
+
+	// lazy, when positive, limits state.json rewrites to one per interval so
+	// bulk runs do not rewrite a large snapshot for every runner. Journal
+	// events are still synced individually.
+	lazy     time.Duration
+	lastSave time.Time
+	dirty    bool
+}
+
+// setLazySaves batches state.json rewrites; zero restores write-through
+// saving and flushes anything pending.
+func (s *runState) setLazySaves(interval time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lazy = interval
+	if interval == 0 && s.dirty {
+		return s.saveLocked()
+	}
+	return nil
+}
+
+func (s *runState) flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty {
+		return nil
+	}
+	return s.saveLocked()
+}
+
+func (s *runState) saveOrDeferLocked() error {
+	if s.lazy > 0 && time.Since(s.lastSave) < s.lazy {
+		s.dirty = true
+		return nil
+	}
+	return s.saveLocked()
 }
 
 func newRunID() (string, error) {
@@ -205,7 +244,7 @@ func (s *runState) record(event string, fields map[string]any) error {
 		return fmt.Errorf("sync journal event %q: %w", event, err)
 	}
 	s.data.UpdatedAt = time.Now().UTC()
-	return s.saveLocked()
+	return s.saveOrDeferLocked()
 }
 
 func (s *runState) update(fn func(*runData)) error {
@@ -213,11 +252,17 @@ func (s *runState) update(fn func(*runData)) error {
 	defer s.mu.Unlock()
 	fn(&s.data)
 	s.data.UpdatedAt = time.Now().UTC()
-	return s.saveLocked()
+	return s.saveOrDeferLocked()
 }
 
 func (s *runState) saveLocked() error {
-	data, err := json.MarshalIndent(s.data, "", "  ")
+	var data []byte
+	var err error
+	if s.lazy > 0 {
+		data, err = json.Marshal(s.data)
+	} else {
+		data, err = json.MarshalIndent(s.data, "", "  ")
+	}
 	if err != nil {
 		return fmt.Errorf("encode run state: %w", err)
 	}
@@ -245,6 +290,8 @@ func (s *runState) saveLocked() error {
 	if err := os.Rename(tmpName, filepath.Join(s.dir, "state.json")); err != nil {
 		return fmt.Errorf("replace state snapshot: %w", err)
 	}
+	s.lastSave = time.Now()
+	s.dirty = false
 	return nil
 }
 
@@ -350,10 +397,20 @@ func writeAtomic(name string, data []byte, mode os.FileMode) error {
 }
 
 func printScaleSummary(w io.Writer, mode string, scale scaleResults) {
-	if mode == "registrations" {
-		if scale.PeakHeld > 0 {
+	if mode == "registrations" || mode == modeHold {
+		switch {
+		case scale.PeakHeld > 0 && mode == modeHold:
+			fmt.Fprintf(w, "Registrations held at once (registered-only, not online runners): peak %d; sampled checks present %d, missing %d\n",
+				scale.PeakHeld, scale.HeldVerified, scale.HeldMissing)
+			if scale.FirstMissingAfterSeconds > 0 {
+				fmt.Fprintf(w, "GHES first dropped a held registration after %ds\n", scale.FirstMissingAfterSeconds)
+			}
+		case scale.PeakHeld > 0:
 			fmt.Fprintf(w, "Registrations held at once (registered-only, not online runners): peak %d; still registered at removal %d, missing %d\n",
 				scale.PeakHeld, scale.HeldVerified, scale.HeldMissing)
+		}
+		if scale.CeilingReason != "" {
+			fmt.Fprintf(w, "Registration stopped at %d runners: %s\n", scale.CeilingRunners, scale.CeilingReason)
 		}
 		return
 	}

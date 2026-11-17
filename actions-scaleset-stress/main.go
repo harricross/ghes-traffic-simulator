@@ -55,7 +55,7 @@ func printUsage(w *os.File) {
 Usage:
   actions-scaleset-stress check   --config <file>
   actions-scaleset-stress prepare --config <file>
-  actions-scaleset-stress run     --config <file> --mode registrations|workflows [--workload synthetic|ci] [limits]
+  actions-scaleset-stress run     --config <file> --mode registrations|workflows|hold [--workload synthetic|ci] [limits]
   actions-scaleset-stress cleanup --config <file> --run-id <id> [--apply]
 
 The GHES token is read from the environment variable named by token_env in
@@ -160,14 +160,14 @@ func commandRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	o := &runOptions{}
 	common := addCommonFlags(fs)
-	fs.StringVar(&o.mode, "mode", "", "required profile: registrations or workflows")
+	fs.StringVar(&o.mode, "mode", "", "required profile: registrations, workflows or hold (bulk registered-only runners held for a long dwell)")
 	fs.StringVar(&o.workload, "workload", workloadSynthetic, "workflows mode: synthetic (matrix sleep jobs) or ci (Lint, sharded unit tests, Build)")
 	fs.StringVar(&o.runID, "run-id", "", "run identifier (default: generated)")
 	fs.DurationVar(&o.duration, "duration", time.Minute, "hard maximum run duration")
-	fs.IntVar(&o.total, "total", 10, "maximum registrations or workflow dispatches")
+	fs.IntVar(&o.total, "total", 10, "maximum registrations or workflow dispatches (hold mode: up to 100000)")
 	fs.Float64Var(&o.rate, "rate", 1, "maximum new registrations or dispatches per second")
-	fs.IntVar(&o.maxInflight, "max-inflight", 5, "maximum concurrent registration operations (registered runners held at once)")
-	fs.DurationVar(&o.dwell, "dwell", 5*time.Second, "registered runner dwell before removal")
+	fs.IntVar(&o.maxInflight, "max-inflight", 5, "maximum concurrent registration operations (registered runners held at once; hold mode: concurrent API calls)")
+	fs.DurationVar(&o.dwell, "dwell", 5*time.Second, "registered runner dwell before removal (up to 1h; hold mode up to 24h)")
 	fs.IntVar(&o.maxRunners, "max-runners", 4, "maximum concurrent official runner containers")
 	fs.IntVar(&o.standingRunners, "standing-runners", 0, "workflows mode: idle runner containers to ramp up to and keep online (0 = on demand only)")
 	fs.Float64Var(&o.rampRate, "ramp-rate", 5, "maximum runner containers started per second while growing the pool")
@@ -190,8 +190,8 @@ func commandRun(args []string) error {
 		return err
 	}
 	o.commonOptions = *common
-	if o.mode != "registrations" && o.mode != "workflows" {
-		return errors.New("--mode must be registrations or workflows")
+	if o.mode != "registrations" && o.mode != "workflows" && o.mode != modeHold {
+		return errors.New("--mode must be registrations, workflows or hold")
 	}
 	if err := o.validate(); err != nil {
 		return err
@@ -326,8 +326,10 @@ func (o runOptions) validate() error {
 		return errors.New("--rate must be > 0 and <= 100 operations per second")
 	case o.maxInflight <= 0 || o.maxInflight > 1000:
 		return errors.New("--max-inflight must be between 1 and 1000")
-	case o.dwell < 0 || o.dwell > time.Hour:
-		return errors.New("--dwell must be between 0 and 1h")
+	case o.dwell < 0 || (o.mode != modeHold && o.dwell > time.Hour) || o.dwell > 24*time.Hour:
+		return errors.New("--dwell must be between 0 and 1h (hold mode: 24h)")
+	case o.mode == modeHold && o.dwell >= o.duration:
+		return errors.New("--duration must exceed --dwell in hold mode so registration and removal have time to finish")
 	case o.maxRunners <= 0 || o.maxRunners > 1000:
 		return errors.New("--max-runners must be between 1 and 1000")
 	case o.standingRunners < 0 || o.standingRunners > 1000:
