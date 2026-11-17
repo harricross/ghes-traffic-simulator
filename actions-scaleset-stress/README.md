@@ -73,6 +73,28 @@ the named environment variable; do not put it in the JSON file or command
 line. The image reference is required only for workflow mode and must use an
 immutable SHA-256 digest.
 
+## Prebuilt Linux binaries
+
+The `actions-scaleset-stress` workflow runs gofmt, `go vet` and the race
+tests on pull requests and pushes to `main` that change the tool. Each such
+push to `main` replaces the `actions-scaleset-stress/edge` prerelease with
+`linux_amd64` and `linux_arm64` archives and `checksums.txt`. Pushing a tag
+such as `actions-scaleset-stress/v0.1.0` publishes a versioned release; a
+tag with a hyphen (`v0.2.0-rc.1`) is published as a prerelease.
+
+To run a release build through the wrapper, from the repository root:
+
+```bash
+tag=actions-scaleset-stress/edge   # or a versioned tag
+rm -rf tmp/release
+gh release download "$tag" -R harricross/ghes-traffic-simulator \
+  -p '*linux_amd64.tar.gz' -p checksums.txt -D tmp/release
+(cd tmp/release && sha256sum --check --ignore-missing checksums.txt)
+mkdir -p tmp/bin && tar -xzf tmp/release/*linux_amd64.tar.gz -C tmp/bin
+export ACTIONS_SCALESET_STRESS_BIN=$PWD/tmp/bin/actions-scaleset-stress
+./actions-scaleset-stress.sh version
+```
+
 ## Commands
 
 Run the wrapper from the repository root; it builds the Go program under

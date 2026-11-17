@@ -24,6 +24,9 @@ func main() {
 	}
 }
 
+// version is set at release build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func execute(args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
 		printUsage(os.Stdout)
@@ -34,7 +37,7 @@ func execute(args []string) error {
 	case "guard":
 		return commandGuard(args[1:])
 	case "version":
-		fmt.Println("actions-scaleset-stress dev")
+		fmt.Println("actions-scaleset-stress", version)
 		return nil
 	case "check":
 		return commandCheck(args[1:])
