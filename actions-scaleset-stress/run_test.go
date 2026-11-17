@@ -1,19 +1,25 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestWorkflowYAMLPreservesShellFormatsAndVerifiesOutput(t *testing.T) {
 	workflow := workflowYAML("load-scale")
 	for _, expected := range []string{
-		"runs-on: load-scale",
+		"runs-on: ${{ inputs.runner_label }}",
 		"printf 'run=%s shard=%s\\n'",
 		"printf 'marker=%s:%s\\n'",
 		"- name: Verify synthetic output",
@@ -171,7 +177,7 @@ func TestVerifyCIJobs(t *testing.T) {
 func TestCIWorkflowMatchesVerifier(t *testing.T) {
 	workflow := ciWorkflowYAML("load-scale")
 	for _, expected := range []string{
-		"runs-on: load-scale",
+		"runs-on: ${{ inputs.runner_label }}",
 		"name: Lint",
 		"name: Test shard ${{ matrix.shard }}",
 		"name: Build",
@@ -267,5 +273,177 @@ func TestCIProjectShardsAllRunTests(t *testing.T) {
 	}
 	if sum < total {
 		t.Fatalf("shards ran %d tests in total", sum)
+	}
+}
+
+func TestWorkflowsDefaultRunnerLabelToScaleSet(t *testing.T) {
+	input := "      runner_label:\n" +
+		"        description: Runner scale set label that runs every job\n" +
+		"        required: false\n" +
+		"        type: string\n" +
+		"        default: 'load-scale'\n"
+	for name, workflow := range map[string]string{"synthetic": workflowYAML("load-scale"), "ci": ciWorkflowYAML("load-scale")} {
+		if !strings.Contains(workflow, input) {
+			t.Errorf("%s workflow lacks the optional runner_label input defaulting to the scale set", name)
+		}
+		if strings.Contains(workflow, "__SCALE_SET_NAME__") {
+			t.Errorf("%s workflow has an unreplaced scale set placeholder", name)
+		}
+		if all, labelled := strings.Count(workflow, "runs-on:"), strings.Count(workflow, "runs-on: ${{ inputs.runner_label }}"); all == 0 || all != labelled {
+			t.Errorf("%s workflow: %d of %d jobs use the runner_label input", name, labelled, all)
+		}
+	}
+}
+
+func TestVerifyWorkflowRunChecksGroupPlacement(t *testing.T) {
+	job := func(runner, group string) apiJob {
+		job := testJob("synthetic (0)", "success", "Synthetic work and output", "success", "Verify synthetic output", "success")
+		job.RunnerName, job.RunnerGroupName = runner, group
+		return job
+	}
+	own := fleetRunnerName("run", "stress-g01", fleetKindReal, 1)
+	other := fleetRunnerName("run", "stress-g02", fleetKindReal, 1)
+	record := workflowRecord{Workload: workloadSynthetic, Shards: 1, Group: "stress-g01"}
+	for name, tc := range map[string]struct {
+		job  apiJob
+		want bool
+	}{
+		"group name matches":       {job(own, "stress-g01"), true},
+		"runner name only":         {job(own, ""), true},
+		"group name differs":       {job(own, "stress-g02"), false},
+		"runner from other group":  {job(other, ""), false},
+		"ran with no runner names": {job("", ""), false},
+	} {
+		ok, reason := verifyWorkflowRun(record, []apiJob{tc.job})
+		if ok != tc.want {
+			t.Errorf("%s: verified %v (%s), want %v", name, ok, reason, tc.want)
+		}
+		if !ok && !strings.Contains(reason, "stress-g01") {
+			t.Errorf("%s: reason %q does not name the expected group", name, reason)
+		}
+	}
+	legacy := record
+	legacy.Group = ""
+	if ok, reason := verifyWorkflowRun(legacy, []apiJob{job(other, "Default")}); !ok {
+		t.Errorf("records without a group must not check placement: %s", reason)
+	}
+	skipped := testJob("Build", "skipped")
+	if ok, reason := verifyJobPlacement([]apiJob{skipped}, "stress-g01"); !ok {
+		t.Errorf("a skipped job has no runner and must pass placement: %s", reason)
+	}
+}
+
+// fakeActions serves the dispatch, run listing and job endpoints that
+// dispatchAndObserve uses. Every dispatched run completes at once with one
+// synthetic job on a runner of the group its runner_label names.
+type fakeActions struct {
+	mu     sync.Mutex
+	groups map[string]string
+	labels []string
+	runs   []apiWorkflowRun
+	jobs   map[int64]apiJob
+}
+
+func (f *fakeActions) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/dispatches"):
+		var body struct {
+			Inputs map[string]string `json:"inputs"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		label := body.Inputs["runner_label"]
+		f.labels = append(f.labels, label)
+		id := int64(1000 + len(f.runs))
+		f.runs = append(f.runs, apiWorkflowRun{ID: id, DisplayTitle: "Actions load " + body.Inputs["run_id"], Status: "completed", Conclusion: "success"})
+		job := testJob("synthetic (0)", "success", "Synthetic work and output", "success", "Verify synthetic output", "success")
+		job.RunnerGroupName = f.groups[label]
+		f.jobs[id] = job
+		_ = json.NewEncoder(w).Encode(map[string]int64{"workflow_run_id": id})
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/runs"):
+		_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": f.runs})
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/jobs"):
+		id, _ := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/repos/lab/load/actions/runs/"), "/jobs"), 10, 64)
+		_ = json.NewEncoder(w).Encode(map[string]any{"jobs": []apiJob{f.jobs[id]}})
+	default:
+		http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusTeapot)
+	}
+}
+
+func newPoolTestTarget(t *testing.T, handler http.Handler) (*target, *runState) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	tgt := &target{
+		api: newGHESAPI(server.URL, "test-token", server.Client()),
+		cfg: config{Owner: "lab", Repo: "load", Ref: "main", WorkflowFile: ".github/workflows/synthetic-load.yml"},
+	}
+	state, err := createRunState(filepath.Join(t.TempDir(), "runs"), "pool-test", "workflows", tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(state.Close)
+	return tgt, state
+}
+
+func newTestRealPools(state *runState, groups ...string) []*realPool {
+	set := newPoolSet()
+	options := runOptions{maxRunners: 10, rampRate: 1}
+	pools := make([]*realPool, 0, len(groups))
+	for i, group := range groups {
+		pools = append(pools, &realPool{
+			Group: group, Label: "load-scale-" + group + "-real", ScaleSetID: i + 1,
+			pool:   newRunnerPool(nil, state, nil, set, i+1, group, 0, 0, options),
+			exited: make(chan struct{}),
+		})
+	}
+	return pools
+}
+
+func TestDispatchAndObserveRoundRobinsAcrossPools(t *testing.T) {
+	fake := &fakeActions{groups: map[string]string{
+		"load-scale-g1-real": "g1",
+		"load-scale-g2-real": "g2",
+	}, jobs: map[int64]apiJob{}}
+	tgt, state := newPoolTestTarget(t, fake)
+	pools := newTestRealPools(state, "g1", "g2")
+	options := runOptions{
+		total: 4, rate: 1000, maxOutstandingJobs: 100, workload: workloadSynthetic, jobsPerRun: 1,
+		jobDuration: time.Second, rampRate: 1, rampTimeout: time.Second,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := dispatchAndObserve(ctx, tgt, state, options, pools, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"load-scale-g1-real", "load-scale-g2-real", "load-scale-g1-real", "load-scale-g2-real"}
+	if fmt.Sprint(fake.labels) != fmt.Sprint(want) {
+		t.Fatalf("dispatched labels %v, want %v", fake.labels, want)
+	}
+	snapshot := state.snapshot()
+	for i, record := range snapshot.Workflows {
+		if pool := pools[i%2]; record.Group != pool.Group || record.RunnerLabel != pool.Label {
+			t.Errorf("workflow %d targets %q/%q, want %q/%q", i, record.Group, record.RunnerLabel, pool.Group, pool.Label)
+		}
+	}
+	if snapshot.Passed != 4 || snapshot.Failed != 0 {
+		t.Fatalf("passed %d failed %d, want 4 verified runs", snapshot.Passed, snapshot.Failed)
+	}
+}
+
+func TestDispatchAndObserveFailsWhenAnyListenerExits(t *testing.T) {
+	tgt, state := newPoolTestTarget(t, http.NotFoundHandler())
+	pools := newTestRealPools(state, "g1", "g2")
+	close(pools[1].exited)
+	options := runOptions{total: 1, rate: 1000, workload: workloadSynthetic, jobsPerRun: 1}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := dispatchAndObserve(ctx, tgt, state, options, pools, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "listener for group g2 stopped unexpectedly") {
+		t.Fatalf("error = %v, want the g2 listener exit", err)
 	}
 }

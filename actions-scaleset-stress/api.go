@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,9 +94,11 @@ type apiWorkflowRun struct {
 }
 
 type apiJob struct {
-	Name       string `json:"name"`
-	Conclusion string `json:"conclusion"`
-	Steps      []struct {
+	Name            string `json:"name"`
+	Conclusion      string `json:"conclusion"`
+	RunnerName      string `json:"runner_name"`
+	RunnerGroupName string `json:"runner_group_name"`
+	Steps           []struct {
 		Name       string `json:"name"`
 		Conclusion string `json:"conclusion"`
 	} `json:"steps"`
@@ -173,6 +176,10 @@ func (t *target) check(ctx context.Context) error {
 	}
 	if len(snapshot.missing) > 0 {
 		t.repoState = fmt.Sprintf("repository exists; %d of %d managed files are missing (run prepare)", len(snapshot.missing), snapshot.total)
+		return nil
+	}
+	if len(snapshot.outdated) > 0 {
+		t.repoState = fmt.Sprintf("repository exists; %d managed workflow files are outdated (run prepare)", len(snapshot.outdated))
 		return nil
 	}
 	for _, file := range []string{t.cfg.WorkflowFile, ciWorkflowFile} {
@@ -261,11 +268,15 @@ type repoSnapshot struct {
 	commit  string
 	tree    string
 	missing []repoFile
-	total   int
+	// outdated lists workflow files this tool generated earlier whose content
+	// is stale; prepare replaces them.
+	outdated []repoFile
+	total    int
 }
 
 // managedSnapshot compares the managed files with the default branch's tree.
-// Files with different content are a conflict: prepare never overwrites them.
+// A managed workflow file whose header still matches the generated workflow is
+// outdated; any other difference is a conflict that prepare never overwrites.
 func (t *target) managedSnapshot(ctx context.Context) (repoSnapshot, error) {
 	base := repositoryPath(t.cfg.Owner, t.cfg.Repo)
 	var ref struct {
@@ -321,24 +332,68 @@ func (t *target) managedSnapshot(ctx context.Context) (repoSnapshot, error) {
 			continue
 		}
 		if entry != "blob "+gitBlobSHA(file.Content) {
-			return repoSnapshot{}, fmt.Errorf("%s differs from the generated load-test content; refusing to run or overwrite it", file.Path)
+			generated, err := t.generatedWorkflow(ctx, file, entry)
+			if err != nil {
+				return repoSnapshot{}, err
+			}
+			if !generated {
+				return repoSnapshot{}, fmt.Errorf("%s differs from the generated load-test content; refusing to run or overwrite it", file.Path)
+			}
+			snapshot.outdated = append(snapshot.outdated, file)
 		}
 	}
 	return snapshot, nil
 }
 
-// installManagedFiles adds every missing managed file in one fast-forward commit.
+// generatedWorkflow reports whether the existing tree entry for a managed
+// workflow file starts with the generated name and run-name lines, so an
+// earlier version of this tool wrote it.
+func (t *target) generatedWorkflow(ctx context.Context, file repoFile, entry string) (bool, error) {
+	if file.Path != t.cfg.WorkflowFile && file.Path != ciWorkflowFile {
+		return false, nil
+	}
+	blobSHA, ok := strings.CutPrefix(entry, "blob ")
+	if !ok || !gitObjectID.MatchString(blobSHA) {
+		return false, nil
+	}
+	var blob struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if _, err := t.api.request(ctx, http.MethodGet, repositoryPath(t.cfg.Owner, t.cfg.Repo)+"/git/blobs/"+blobSHA, nil, &blob, http.StatusOK); err != nil {
+		return false, fmt.Errorf("read existing %s: %w", file.Path, err)
+	}
+	if blob.Encoding != "base64" {
+		return false, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(blob.Content, "\n", ""))
+	if err != nil {
+		return false, nil
+	}
+	return workflowHeader(string(data)) == workflowHeader(file.Content), nil
+}
+
+func workflowHeader(content string) string {
+	lines := strings.SplitN(content, "\n", 3)
+	if len(lines) < 3 {
+		return ""
+	}
+	return lines[0] + "\n" + lines[1]
+}
+
+// installManagedFiles adds every missing managed file and replaces outdated
+// generated workflows in one fast-forward commit.
 func (t *target) installManagedFiles(ctx context.Context) error {
 	snapshot, err := t.managedSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	if len(snapshot.missing) == 0 {
+	if len(snapshot.missing) == 0 && len(snapshot.outdated) == 0 {
 		return nil
 	}
 	base := repositoryPath(t.cfg.Owner, t.cfg.Repo)
-	entries := make([]map[string]string, 0, len(snapshot.missing))
-	for _, file := range snapshot.missing {
+	entries := make([]map[string]string, 0, len(snapshot.missing)+len(snapshot.outdated))
+	for _, file := range append(snapshot.missing, snapshot.outdated...) {
 		entries = append(entries, map[string]string{"path": file.Path, "mode": "100644", "type": "blob", "content": file.Content})
 	}
 	var created struct {
@@ -353,7 +408,7 @@ func (t *target) installManagedFiles(ctx context.Context) error {
 	treeSHA := created.SHA
 	created.SHA = ""
 	if _, err := t.api.request(ctx, http.MethodPost, base+"/git/commits", map[string]any{
-		"message": fmt.Sprintf("Add Actions load-test workflows and CI project (%d files)", len(entries)),
+		"message": fmt.Sprintf("Install Actions load-test workflows and CI project (%d added, %d updated)", len(snapshot.missing), len(snapshot.outdated)),
 		"tree":    treeSHA,
 		"parents": []string{snapshot.commit},
 	}, &created, http.StatusCreated); err != nil {
@@ -380,7 +435,7 @@ func escapeAPIPath(value string) string {
 	return strings.Join(parts, "/")
 }
 
-func (a *ghesAPI) dispatch(ctx context.Context, cfg config, workflowFile, marker string, shards, failures []int, duration time.Duration, logBytes int) (int64, error) {
+func (a *ghesAPI) dispatch(ctx context.Context, cfg config, workflowFile, marker, runnerLabel string, shards, failures []int, duration time.Duration, logBytes int) (int64, error) {
 	shardJSON, _ := json.Marshal(shards)
 	failJSON, _ := json.Marshal(failures)
 	inputs := map[string]string{
@@ -389,6 +444,9 @@ func (a *ghesAPI) dispatch(ctx context.Context, cfg config, workflowFile, marker
 		"failure_shards":   string(failJSON),
 		"duration_seconds": strconv.Itoa(int(duration.Seconds())),
 		"log_bytes":        strconv.Itoa(logBytes),
+	}
+	if runnerLabel != "" {
+		inputs["runner_label"] = runnerLabel
 	}
 	var out struct {
 		WorkflowRunID int64 `json:"workflow_run_id"`
@@ -430,13 +488,18 @@ on:
         description: Bounded synthetic log output
         required: true
         type: string
+      runner_label:
+        description: Runner scale set label that runs every job
+        required: false
+        type: string
+        default: '__SCALE_SET_NAME__'
 jobs:
   synthetic:
     strategy:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(inputs.shards) }}
-    runs-on: __SCALE_SET_NAME__
+    runs-on: ${{ inputs.runner_label }}
     steps:
       - name: Synthetic work and output
         id: work

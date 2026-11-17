@@ -64,6 +64,60 @@ type runnerPool struct {
 	rampRate float64
 	wake     chan struct{}
 	fatal    chan error
+
+	// group, when set, is the runner group this pool serves; runner and
+	// container names include it.
+	group string
+	// set, when set, aggregates host-wide counts across every pool on this
+	// host; a nil set counts this pool alone.
+	set *poolSet
+
+	standingTarget  int
+	started         int
+	provisionErrors int
+	containerExits  int
+	peakLive        int
+	peakBusy        int
+	peakActiveJobs  int
+	ceilingReason   string
+	rampFinishedAt  time.Time
+}
+
+// poolSummary reports one pool's provisioning results.
+type poolSummary struct {
+	Group           string    `json:"group,omitempty"`
+	ScaleSetID      int       `json:"scale_set_id"`
+	StandingTarget  int       `json:"standing_target"`
+	MaxRunners      int       `json:"max_runners"`
+	Started         int       `json:"started"`
+	Live            int       `json:"live"`
+	PeakLive        int       `json:"peak_live"`
+	PeakBusy        int       `json:"peak_busy"`
+	PeakActiveJobs  int       `json:"peak_active_jobs"`
+	ProvisionErrors int       `json:"provision_errors"`
+	ContainerExits  int       `json:"container_exits"`
+	CeilingRunners  int       `json:"ceiling_runners,omitempty"`
+	CeilingReason   string    `json:"ceiling_reason,omitempty"`
+	RampFinishedAt  time.Time `json:"ramp_finished_at,omitzero"`
+}
+
+// poolSet groups the runner pools that share this host so that peaks, ramp
+// ceilings and the host guard count every pool's runners. Its pools share one
+// fatal channel; the first error wins.
+type poolSet struct {
+	mu    sync.Mutex
+	pools []*runnerPool
+	fatal chan error
+}
+
+func newPoolSet() *poolSet {
+	return &poolSet{fatal: make(chan error, 1)}
+}
+
+func (s *poolSet) add(p *runnerPool) {
+	s.mu.Lock()
+	s.pools = append(s.pools, p)
+	s.mu.Unlock()
 }
 
 func newDockerClient(ctx context.Context, imageRef string) (*dockerclient.Client, error) {
@@ -98,21 +152,34 @@ func newDockerClient(ctx context.Context, imageRef string) (*dockerclient.Client
 	return client, nil
 }
 
-func newRunnerPool(t *target, state *runState, docker *dockerclient.Client, scaleSetID int, options runOptions) *runnerPool {
+// newRunnerPool creates a pool for one scale set. maxRunners caps its live
+// runners; zero uses --max-runners. A non-empty group switches to fleet runner
+// and container names.
+func newRunnerPool(t *target, state *runState, docker *dockerclient.Client, set *poolSet, scaleSetID int, group string, standing, maxRunners int, options runOptions) *runnerPool {
+	if maxRunners <= 0 {
+		maxRunners = options.maxRunners
+	}
 	pool := &runnerPool{
-		target:      t,
-		state:       state,
-		docker:      docker,
-		scaleSetID:  scaleSetID,
-		maxRunners:  options.maxRunners,
-		memoryBytes: options.runnerMemoryMiB * 1024 * 1024,
-		nanoCPUs:    int64(math.Round(options.runnerCPUs * 1e9)),
-		entries:     make(map[string]managedRunner),
-		standing:    options.standingRunners,
-		diskPath:    state.dir,
-		rampRate:    options.rampRate,
-		wake:        make(chan struct{}, 1),
-		fatal:       make(chan error, 1),
+		target:         t,
+		state:          state,
+		docker:         docker,
+		scaleSetID:     scaleSetID,
+		maxRunners:     maxRunners,
+		memoryBytes:    options.runnerMemoryMiB * 1024 * 1024,
+		nanoCPUs:       int64(math.Round(options.runnerCPUs * 1e9)),
+		entries:        make(map[string]managedRunner),
+		standing:       standing,
+		standingTarget: standing,
+		diskPath:       state.dir,
+		rampRate:       options.rampRate,
+		wake:           make(chan struct{}, 1),
+		fatal:          make(chan error, 1),
+		group:          group,
+		set:            set,
+	}
+	if set != nil {
+		pool.fatal = set.fatal
+		set.add(pool)
 	}
 	if options.hostGuard {
 		pool.limits = &hostLimits{
@@ -169,9 +236,10 @@ func (p *runnerPool) Scale(ctx context.Context, message *scaleset.RunnerScaleSet
 	p.mu.Lock()
 	p.assigned = message.Statistics.TotalAssignedJobs
 	p.stats = *message.Statistics
+	p.peakBusy = max(p.peakBusy, message.Statistics.TotalBusyRunners)
 	p.mu.Unlock()
 	p.nudge()
-	return p.notePeaks(*message.Statistics)
+	return p.notePeaks()
 }
 
 func (p *runnerPool) nudge() {
@@ -187,11 +255,56 @@ func (p *runnerPool) markJobStarted(name string) {
 	if entry, ok := p.entries[name]; ok {
 		entry.jobStarted = true
 		p.entries[name] = entry
+		p.peakActiveJobs = max(p.peakActiveJobs, p.activeJobsLocked())
 	}
 }
 
-func (p *runnerPool) notePeaks(stats scaleset.RunnerScaleSetStatistic) error {
-	live := p.count()
+// siblings returns every pool sharing this host, including p.
+func (p *runnerPool) siblings() []*runnerPool {
+	if p.set == nil {
+		return []*runnerPool{p}
+	}
+	p.set.mu.Lock()
+	defer p.set.mu.Unlock()
+	return append([]*runnerPool(nil), p.set.pools...)
+}
+
+// hostRunners sums live and starting runners across the pools on this host,
+// excluding skip. It must not be called with p.mu held.
+func (p *runnerPool) hostRunners(skip *runnerPool) (live, starting int) {
+	for _, pool := range p.siblings() {
+		if pool == skip {
+			continue
+		}
+		pool.mu.Lock()
+		live += len(pool.entries)
+		starting += pool.starting
+		pool.mu.Unlock()
+	}
+	return live, starting
+}
+
+// hostStats sums the latest scale-set statistics of every pool on this host.
+func (p *runnerPool) hostStats() scaleset.RunnerScaleSetStatistic {
+	var total scaleset.RunnerScaleSetStatistic
+	for _, pool := range p.siblings() {
+		pool.mu.Lock()
+		stats := pool.stats
+		pool.mu.Unlock()
+		total.TotalAvailableJobs += stats.TotalAvailableJobs
+		total.TotalAcquiredJobs += stats.TotalAcquiredJobs
+		total.TotalAssignedJobs += stats.TotalAssignedJobs
+		total.TotalRunningJobs += stats.TotalRunningJobs
+		total.TotalRegisteredRunners += stats.TotalRegisteredRunners
+		total.TotalBusyRunners += stats.TotalBusyRunners
+		total.TotalIdleRunners += stats.TotalIdleRunners
+	}
+	return total
+}
+
+func (p *runnerPool) notePeaks() error {
+	live, _ := p.hostRunners(nil)
+	stats := p.hostStats()
 	return p.state.update(func(data *runData) {
 		scale := &data.Scale
 		scale.PeakContainers = max(scale.PeakContainers, live)
@@ -213,6 +326,10 @@ func (p *runnerPool) count() int {
 func (p *runnerPool) activeJobs() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.activeJobsLocked()
+}
+
+func (p *runnerPool) activeJobsLocked() int {
 	active := 0
 	for _, entry := range p.entries {
 		if entry.jobStarted {
@@ -220,6 +337,36 @@ func (p *runnerPool) activeJobs() int {
 		}
 	}
 	return active
+}
+
+// fields adds the pool's group and scale set to fleet journal events.
+func (p *runnerPool) fields(fields map[string]any) map[string]any {
+	if p.group != "" {
+		fields["group"] = p.group
+		fields["scale_set_id"] = p.scaleSetID
+	}
+	return fields
+}
+
+func (p *runnerPool) summary() poolSummary {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return poolSummary{
+		Group:           p.group,
+		ScaleSetID:      p.scaleSetID,
+		StandingTarget:  p.standingTarget,
+		MaxRunners:      p.maxRunners,
+		Started:         p.started,
+		Live:            len(p.entries),
+		PeakLive:        p.peakLive,
+		PeakBusy:        p.peakBusy,
+		PeakActiveJobs:  p.peakActiveJobs,
+		ProvisionErrors: p.provisionErrors,
+		ContainerExits:  p.containerExits,
+		CeilingRunners:  p.ceiling,
+		CeilingReason:   p.ceilingReason,
+		RampFinishedAt:  p.rampFinishedAt,
+	}
 }
 
 func (p *runnerPool) setStanding(n int) {
@@ -245,33 +392,19 @@ func (p *runnerPool) rampComplete() bool {
 	return p.starting == 0 && len(p.entries) >= p.desiredLocked()
 }
 
-// waitRamped blocks until the standing pool is complete or the timeout passes.
-func (p *runnerPool) waitRamped(ctx context.Context, timeout time.Duration) error {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for !p.rampComplete() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case err := <-p.fatal:
-			return err
-		case <-deadline.C:
-			_ = p.state.record("ramp_timeout", map[string]any{"containers": p.count()})
-			return p.markRampFinished()
-		case <-ticker.C:
-		}
+// markRampFinished records when this pool's standing ramp ended.
+func (p *runnerPool) markRampFinished() {
+	p.mu.Lock()
+	if p.rampFinishedAt.IsZero() {
+		p.rampFinishedAt = time.Now().UTC()
 	}
-	return p.markRampFinished()
+	p.mu.Unlock()
 }
 
-func (p *runnerPool) markRampFinished() error {
-	return p.state.update(func(data *runData) {
-		if data.Scale.RampFinishedAt.IsZero() {
-			data.Scale.RampFinishedAt = time.Now().UTC()
-		}
-	})
+// rampTimedOut ends a ramp that did not complete in time.
+func (p *runnerPool) rampTimedOut() {
+	_ = p.state.record("ramp_timeout", p.fields(map[string]any{"containers": p.count()}))
+	p.markRampFinished()
 }
 
 // provision converges the live runner count toward the desired count at the
@@ -367,10 +500,8 @@ func (p *runnerPool) checkHost() (int, string) {
 	if err != nil {
 		return hostCeiling, err.Error()
 	}
-	p.mu.Lock()
-	live := len(p.entries) + p.starting - 1
-	p.mu.Unlock()
-	return p.limits.evaluate(sample, live)
+	live, starting := p.hostRunners(nil)
+	return p.limits.evaluate(sample, live+starting-1)
 }
 
 // lowerCeiling caps the pool at its current size. A pool with no runners
@@ -386,20 +517,31 @@ func (p *runnerPool) lowerCeiling(reason string) {
 	changed := p.ceiling == 0 || live < p.ceiling
 	if changed {
 		p.ceiling = live
+		p.ceilingReason = reason
 	}
 	p.mu.Unlock()
 	if !changed {
 		return
 	}
-	fmt.Printf("Ramp ceiling reached at %d runners: %s\n", live, reason)
+	otherLive, otherStarting := p.hostRunners(p)
+	hostReason := reason
+	if p.group == "" {
+		fmt.Printf("Ramp ceiling reached at %d runners: %s\n", live, reason)
+	} else {
+		fmt.Printf("Group %s ramp ceiling reached at %d runners: %s\n", p.group, live, reason)
+		hostReason = "group " + p.group + ": " + reason
+	}
 	_ = p.state.update(func(data *runData) {
-		data.Scale.CeilingRunners = live
-		data.Scale.CeilingReason = reason
+		data.Scale.CeilingRunners = live + otherLive + otherStarting
+		data.Scale.CeilingReason = hostReason
 	})
-	_ = p.state.record("ramp_ceiling", map[string]any{"runners": live, "reason": reason})
+	_ = p.state.record("ramp_ceiling", p.fields(map[string]any{"runners": live, "reason": reason}))
 }
 
 func (p *runnerPool) fail(err error) {
+	if p.group != "" {
+		err = fmt.Errorf("group %s: %w", p.group, err)
+	}
 	select {
 	case p.fatal <- err:
 	default:
@@ -419,11 +561,12 @@ func (p *runnerPool) finishStart(ctx context.Context, err error) {
 		return
 	}
 	p.failures++
+	p.provisionErrors++
 	consecutive := p.failures
 	live := len(p.entries) + p.starting
 	p.mu.Unlock()
 	_ = p.state.update(func(data *runData) { data.Scale.ProvisionErrors++ })
-	_ = p.state.record("runner_provision_failed", map[string]any{"error": safeError(err), "consecutive": consecutive, "live": live})
+	_ = p.state.record("runner_provision_failed", p.fields(map[string]any{"error": safeError(err), "consecutive": consecutive, "live": live}))
 	if consecutive < maxConsecutiveStartFailures {
 		return
 	}
@@ -437,12 +580,27 @@ func (p *runnerPool) finishStart(ctx context.Context, err error) {
 	p.lowerCeiling("provisioning failed: " + safeError(err))
 }
 
+func (p *runnerPool) runnerNameFor(index int) string {
+	if p.group == "" {
+		return runnerName(p.state.data.RunID, 100000+index)
+	}
+	return fleetRunnerName(p.state.data.RunID, p.group, fleetKindReal, index)
+}
+
+func (p *runnerPool) containerNameFor(index int) string {
+	prefix := "ghes-load-" + shortHash(p.state.data.RunID) + "-"
+	if p.group != "" {
+		prefix += p.group + "-"
+	}
+	return prefix + fmt.Sprintf("%06d", index)
+}
+
 func (p *runnerPool) startRunner(ctx context.Context) error {
 	p.mu.Lock()
 	p.runSeq++
 	index := p.runSeq
 	p.mu.Unlock()
-	name := runnerName(p.state.data.RunID, 100000+index)
+	name := p.runnerNameFor(index)
 	if err := p.state.record("workflow_runner_intent", map[string]any{"runner_name": name}); err != nil {
 		return err
 	}
@@ -454,7 +612,7 @@ func (p *runnerPool) startRunner(ctx context.Context) error {
 		observed, lookupErr := p.target.scaleSet.GetRunnerByName(context.WithoutCancel(ctx), name)
 		if lookupErr == nil && observed != nil {
 			if stateErr := p.state.update(func(data *runData) {
-				data.Runners = append(data.Runners, runnerRecord{ID: observed.ID, Name: name, CreatedAt: time.Now().UTC()})
+				data.Runners = append(data.Runners, runnerRecord{ID: observed.ID, Name: name, ScaleSetID: p.scaleSetID, CreatedAt: time.Now().UTC()})
 			}); stateErr != nil {
 				return errors.Join(fmt.Errorf("generate runner config: %w", err), stateErr)
 			}
@@ -466,7 +624,7 @@ func (p *runnerPool) startRunner(ctx context.Context) error {
 		}
 		if lookupErr != nil {
 			stateErr := p.state.update(func(data *runData) {
-				data.Runners = append(data.Runners, runnerRecord{Name: name, CreatedAt: time.Now().UTC()})
+				data.Runners = append(data.Runners, runnerRecord{Name: name, ScaleSetID: p.scaleSetID, CreatedAt: time.Now().UTC()})
 				data.Unresolved++
 			})
 			return errors.Join(fmt.Errorf("generate runner config failed and reconciliation is unresolved: %w", err), stateErr)
@@ -477,12 +635,12 @@ func (p *runnerPool) startRunner(ctx context.Context) error {
 		return fmt.Errorf("runner config for %s did not include a runner identity and JIT config", name)
 	}
 	if err := p.state.update(func(data *runData) {
-		data.Runners = append(data.Runners, runnerRecord{ID: jit.Runner.ID, Name: name, CreatedAt: time.Now().UTC()})
+		data.Runners = append(data.Runners, runnerRecord{ID: jit.Runner.ID, Name: name, ScaleSetID: p.scaleSetID, CreatedAt: time.Now().UTC()})
 	}); err != nil {
 		_ = removeRunner(context.Background(), p.target, p.state, jit.Runner.ID, name)
 		return err
 	}
-	containerName := "ghes-load-" + shortHash(p.state.data.RunID) + "-" + fmt.Sprintf("%06d", index)
+	containerName := p.containerNameFor(index)
 	config := &container.Config{
 		Image: p.target.cfg.RunnerImage,
 		User:  "runner",
@@ -511,8 +669,10 @@ func (p *runnerPool) startRunner(ctx context.Context) error {
 	entry := managedRunner{name: name, runnerID: jit.Runner.ID, containerID: created.ID}
 	p.mu.Lock()
 	p.entries[name] = entry
-	live := len(p.entries)
+	p.started++
+	p.peakLive = max(p.peakLive, len(p.entries))
 	p.mu.Unlock()
+	live, _ := p.hostRunners(nil)
 	if err := p.state.update(func(data *runData) {
 		data.ContainerIDs = append(data.ContainerIDs, created.ID)
 		data.Scale.PeakContainers = max(data.Scale.PeakContainers, live)
@@ -640,13 +800,14 @@ func (p *runnerPool) retireExited(ctx context.Context, entry managedRunner) {
 		return
 	}
 	delete(p.entries, entry.name)
+	p.containerExits++
 	p.mu.Unlock()
 	_ = p.docker.ContainerRemove(context.WithoutCancel(ctx), entry.containerID, container.RemoveOptions{Force: true})
 	removeErr := removeRunner(context.WithoutCancel(ctx), p.target, p.state, entry.runnerID, entry.name)
 	_ = p.state.update(func(data *runData) { data.Scale.ContainerExits++ })
-	_ = p.state.record("runner_container_exited", map[string]any{
+	_ = p.state.record("runner_container_exited", p.fields(map[string]any{
 		"runner_name": entry.name, "exit_code": exitCode, "oom_killed": oomKilled, "remove_error": errString(removeErr),
-	})
+	}))
 	if exitCode != 0 || oomKilled {
 		p.mu.Lock()
 		live := len(p.entries) + p.starting
@@ -669,11 +830,14 @@ func (p *runnerPool) reportStatus() {
 	p.mu.Unlock()
 	line := fmt.Sprintf("containers=%d desired=%d ceiling=%d active_jobs=%d | ghes registered=%d idle=%d busy=%d assigned_jobs=%d running_jobs=%d",
 		containers, desired, ceiling, active, stats.TotalRegisteredRunners, stats.TotalIdleRunners, stats.TotalBusyRunners, stats.TotalAssignedJobs, stats.TotalRunningJobs)
-	fields := map[string]any{
+	if p.group != "" {
+		line = "group=" + p.group + " " + line
+	}
+	fields := p.fields(map[string]any{
 		"containers": containers, "desired": desired, "ceiling": ceiling,
 		"registered": stats.TotalRegisteredRunners, "idle": stats.TotalIdleRunners, "busy": stats.TotalBusyRunners,
 		"assigned_jobs": stats.TotalAssignedJobs, "running_jobs": stats.TotalRunningJobs,
-	}
+	})
 	if sample, err := readHostSample(p.diskPath); err == nil {
 		line += fmt.Sprintf(" | host mem_available=%dMiB load1=%.1f disk_free=%dMiB", sample.memAvailableBytes>>20, sample.load1, sample.diskFreeBytes>>20)
 		fields["mem_available_mib"], fields["load1"], fields["disk_free_mib"] = sample.memAvailableBytes>>20, sample.load1, sample.diskFreeBytes>>20

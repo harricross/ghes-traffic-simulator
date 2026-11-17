@@ -129,6 +129,11 @@ on:
         description: Bounded extra test log output
         required: true
         type: string
+      runner_label:
+        description: Runner scale set label that runs every job
+        required: false
+        type: string
+        default: '__SCALE_SET_NAME__'
 permissions:
   contents: read
 defaults:
@@ -138,7 +143,7 @@ defaults:
 jobs:
   lint:
     name: Lint
-    runs-on: __SCALE_SET_NAME__
+    runs-on: ${{ inputs.runner_label }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -149,7 +154,7 @@ jobs:
   test:
     name: Test shard ${{ matrix.shard }}
     needs: lint
-    runs-on: __SCALE_SET_NAME__
+    runs-on: ${{ inputs.runner_label }}
     strategy:
       fail-fast: false
       matrix:
@@ -196,7 +201,7 @@ jobs:
   build:
     name: Build
     needs: test
-    runs-on: __SCALE_SET_NAME__
+    runs-on: ${{ inputs.runner_label }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
