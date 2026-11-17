@@ -475,6 +475,20 @@ func (h *holder) removeAll(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+func isRunnerNotFound(err error) bool {
+	return errors.Is(err, scaleset.NotFoundError) || errors.Is(err, scaleset.RunnerNotFoundError)
+}
+
+// inspectRunnerByID returns nil when the runner no longer exists. The SDK
+// reports a missing ID as an error rather than a nil result.
+func inspectRunnerByID(ctx context.Context, api runnerAPI, id int) (*scaleset.RunnerReference, error) {
+	observed, err := api.GetRunner(ctx, id)
+	if err != nil && isRunnerNotFound(err) {
+		return nil, nil
+	}
+	return observed, err
+}
+
 func (h *holder) removeOne(ctx context.Context, index int) error {
 	h.mu.Lock()
 	runner := h.runners[index]
@@ -485,7 +499,7 @@ func (h *holder) removeOne(ctx context.Context, index int) error {
 	id := runner.id
 	if id > 0 && h.verifyOwnership {
 		callCtx, cancel := context.WithTimeout(ctx, holdCallTimeout)
-		observed, err := h.api.GetRunner(callCtx, id)
+		observed, err := inspectRunnerByID(callCtx, h.api, id)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("inspect journaled runner %s: %w", runner.name, err)
@@ -514,7 +528,7 @@ func (h *holder) removeOne(ctx context.Context, index int) error {
 		callCtx, cancel := context.WithTimeout(ctx, holdCallTimeout)
 		err = h.api.RemoveRunner(callCtx, int64(id))
 		cancel()
-		if err == nil {
+		if err == nil || isRunnerNotFound(err) {
 			return h.markRemoved(index, runner)
 		}
 		select {

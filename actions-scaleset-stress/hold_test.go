@@ -70,7 +70,8 @@ func (f *fakeRunnerAPI) GetRunner(_ context.Context, id int) (*scaleset.RunnerRe
 			return &scaleset.RunnerReference{ID: id, Name: name}, nil
 		}
 	}
-	return nil, nil
+	// The real client reports a missing ID as a 404 error, not a nil result.
+	return nil, fmt.Errorf("unexpected status code: 404: %w", scaleset.NotFoundError)
 }
 
 func (f *fakeRunnerAPI) RemoveRunner(_ context.Context, id int64) error {
@@ -83,7 +84,7 @@ func (f *fakeRunnerAPI) RemoveRunner(_ context.Context, id int64) error {
 			return nil
 		}
 	}
-	return errors.New("runner not found")
+	return fmt.Errorf("unexpected status code: 404: %w", scaleset.RunnerNotFoundError)
 }
 
 func (f *fakeRunnerAPI) registered() int {
@@ -300,6 +301,24 @@ func TestCleanupVerifiesJournaledIDMatchesName(t *testing.T) {
 	}
 	if api.registered() != 1 {
 		t.Fatal("runner with a mismatched name was removed")
+	}
+}
+
+func TestCleanupTreatsAlreadyRemovedRunnersAsDone(t *testing.T) {
+	api := newFakeRunnerAPI()
+	name := runnerName("hold-test", 1)
+	state := newTestState(t)
+	if err := state.update(func(data *runData) { data.Runners = append(data.Runners, runnerRecord{ID: 77, Name: name}) }); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHolder(api, state)
+	h.verifyOwnership = true
+	h.runners = []heldRunner{{id: 77, name: name, pos: 0}}
+	if err := h.removeAll(context.Background()); err != nil {
+		t.Fatalf("a runner that is already gone must count as removed: %v", err)
+	}
+	if !state.snapshot().Runners[0].Removed {
+		t.Fatal("already-gone runner was not marked removed")
 	}
 }
 

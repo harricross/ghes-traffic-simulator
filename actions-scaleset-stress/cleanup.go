@@ -38,7 +38,7 @@ func cleanupRun(ctx context.Context, t *target, state *runState) error {
 		var observed *scaleset.RunnerReference
 		var err error
 		if runner.ID > 0 {
-			observed, err = t.scaleSet.GetRunner(ctx, runner.ID)
+			observed, err = inspectRunnerByID(ctx, t.scaleSet, runner.ID)
 		} else {
 			observed, err = t.scaleSet.GetRunnerByName(ctx, runner.Name)
 		}
