@@ -426,8 +426,8 @@ func TestDispatchAndObserveRoundRobinsAcrossPools(t *testing.T) {
 	}
 	snapshot := state.snapshot()
 	for i, record := range snapshot.Workflows {
-		if pool := pools[i%2]; record.Group != pool.Group || record.RunnerLabel != pool.Label {
-			t.Errorf("workflow %d targets %q/%q, want %q/%q", i, record.Group, record.RunnerLabel, pool.Group, pool.Label)
+		if pool := pools[i%2]; record.Group != pool.Group || record.RunnerLabel != pool.Label || record.Outcome != workflowPassed {
+			t.Errorf("workflow %d targets %q/%q with outcome %q, want %q/%q passed", i, record.Group, record.RunnerLabel, record.Outcome, pool.Group, pool.Label)
 		}
 	}
 	if snapshot.Passed != 4 || snapshot.Failed != 0 {

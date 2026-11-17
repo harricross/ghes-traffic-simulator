@@ -514,13 +514,22 @@ func pollWorkflowRuns(ctx context.Context, t *target, state *runState, since tim
 		}
 		if err := state.update(func(data *runData) {
 			data.Completed++
+			outcome := workflowPassed
 			switch {
 			case !valid:
 				data.Failed++
+				outcome = workflowFailed
 			case current.ExpectedFailures > 0:
 				data.IntentionalFailures++
+				outcome = workflowIntentionalFailure
 			default:
 				data.Passed++
+			}
+			for i := range data.Workflows {
+				if data.Workflows[i].Marker == marker {
+					data.Workflows[i].Outcome = outcome
+					break
+				}
 			}
 		}); err != nil {
 			return outstanding, err

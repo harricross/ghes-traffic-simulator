@@ -15,6 +15,10 @@ disposable runner scale sets. It has two profiles:
   real check pipeline (lint, sharded unit tests, build) from a small project
   that `prepare` commits. A selected percentage of runs can fail
   intentionally; the rest are expected to pass and are verified.
+- `fleet` creates several organization runner groups, each holding a mix of
+  real container runners, fake runners that appear online, and registered-only
+  runners, then runs workflows on the real ones; see [Runner groups mixing
+  real and fake runners](#runner-groups-mixing-real-and-fake-runners---mode-fleet).
 
 There is no fake GHES server or mock runner protocol. The tool does not contact
 GHES until `check`, `prepare`, `run`, or `cleanup` is explicitly invoked.
@@ -61,7 +65,10 @@ Create a non-secret JSON file, for example `actions-scaleset-stress.json`:
 }
 ```
 
-`config_url` is the repository's HTTPS URL, not its API URL. Set the token in
+`config_url` is the repository's HTTPS URL, not its API URL. Fleet mode instead
+needs the owning organization's URL (`https://ghes.example.test/load-lab`) so
+its runner groups and scale sets belong to the organization; other modes
+accept either. Set the token in
 the named environment variable; do not put it in the JSON file or command
 line. The image reference is required only for workflow mode and must use an
 immutable SHA-256 digest.
@@ -304,6 +311,82 @@ applies here too.
 For comparison, a real runner container used about 768 MiB each. The Actions
 data lives in MSSQL (`/data/user/mssql`), not MySQL; the MySQL size did not
 change measurably with 1000 runners.
+
+### Runner groups mixing real and fake runners (`--mode fleet`)
+
+`--mode fleet` fills several organization runner groups at once. Each group
+holds any mix of:
+
+- **real** runners: digest-pinned runner containers that run dispatched
+  workflows, as in `--mode workflows`;
+- **online** fake runners: JIT registrations with an open session and long
+  poll (the `probe-online` technique), so GHES lists them as idle;
+- **offline** fake runners: registrations only (the `hold` technique).
+
+Each group gets two scale sets, `<scale_set_name>-<group>-real` and
+`<scale_set_name>-<group>-fake`, so fake runners never match a workflow
+label. Both count toward the group's 10,000-runner limit.
+
+Fleet mode needs an organization-scope configuration (see
+[Configure](#configure)) and a private repository in that organization
+prepared with `prepare` (re-run `prepare` on repositories prepared before
+fleet mode existed so the workflows accept a `runner_label` input). The token
+needs `admin:org` to create runner groups. Describe the groups in a non-secret
+spec file:
+
+```json
+{
+  "group_prefix": "stress",
+  "groups": [
+    {"name": "g01", "real": 10, "online": 3000, "offline": 6990},
+    {"name": "g02", "real": 10, "online": 3000, "offline": 6990},
+    {"name": "g03", "online": 0, "offline": 10000}
+  ]
+}
+```
+
+```bash
+ulimit -n 10000
+./actions-scaleset-stress.sh run --config fleet-config.json --mode fleet --fleet fleet.json \
+  --rate 25 --max-inflight 16 --open-concurrency 6 --max-runners 20 \
+  --workload ci --total 60 --jobs-per-run 5 --dispatch-rate 0.5 \
+  --dwell 15m --duration 2h
+```
+
+- Group names are `<group_prefix>-<name>` (lowercase letters, digits and
+  hyphens; up to 20 groups). A missing group is created with access limited to
+  the stress repository; an existing group is reused and left in place. The
+  run refuses default or enterprise-inherited groups, a reused group that
+  cannot run the repository's workflows, leftover scale sets from an earlier
+  run, and any group whose existing runners plus the requested ones would
+  exceed 10,000.
+- Before creating anything the run also checks that the real runners fit
+  `--max-runners`, that `ulimit -n` covers one connection per online runner
+  plus 1,024, that memory covers about 0.25 GiB per 1,000 online sessions
+  above `--min-free-mem-mib`, and that `--duration` covers fake fill and
+  removal at `--rate`, the real ramp, `--dwell` (or the dispatch window if
+  longer) and a 10-minute margin. It prints the minimum duration if not.
+- Fake runners are registered round-robin across groups at `--rate`; the
+  first `online` in each group get sessions opened at `--open-concurrency`.
+  Hitting the 10,000 limit stops only that group. Real runners ramp to each
+  group's `real` count while the fake fill runs. Once both finish, `--total`
+  workflows are dispatched round-robin over groups with real runners at
+  `--dispatch-rate`, each pinned to that group's `-real` label, and every job
+  is checked to have run in its group.
+- The fleet is then held until `--dwell` has passed and every workflow has
+  finished, whichever is later. Per-group status is printed and journaled
+  every minute: registered, idle and busy counts, the group's REST runner
+  count, sessions open, poll errors and unexpected messages (anything other
+  than an empty poll; this should stay 0). Held registrations are
+  spot-checked as in hold mode.
+- Teardown closes sessions, removes fake runners at `--rate`, stops real
+  runners, deletes the scale sets, then deletes groups this run created once
+  GHES reports them empty. `cleanup --run-id <id> --apply` repeats the same
+  steps from the journal; the cleanup deadline grows with the runner count.
+- The console summary and `report.json` (`fleet_groups`) give one line per
+  group: peaks for real, busy, fake idle and group runners; sessions opened
+  and failed; fake runners registered against requested with any ceiling
+  reason; and workflows passed, intentionally failed, failed and unresolved.
 
 ## Validation
 

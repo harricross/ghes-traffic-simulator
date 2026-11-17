@@ -165,6 +165,57 @@ func fleetCleanupTimeout(runners int) time.Duration {
 	return max(10*time.Minute, time.Duration(1.5*float64(secondsAt(runners, holdCleanupRate)))+5*time.Minute)
 }
 
+// prepareFleetOptions loads the fleet spec into o and refuses, before
+// anything is created, a run this host or --duration cannot carry.
+func prepareFleetOptions(o *runOptions, cfg config) (fleetBudget, error) {
+	if cfg.scope() != scopeOrg {
+		return fleetBudget{}, errors.New("fleet mode needs an organization config_url (https://<host>/<owner>) so runner groups and scale sets belong to the organization")
+	}
+	spec, err := loadFleetSpec(o.fleetPath)
+	if err != nil {
+		return fleetBudget{}, err
+	}
+	if err := spec.validate(cfg.ScaleSetName); err != nil {
+		return fleetBudget{}, err
+	}
+	o.fleet = spec
+	b := spec.budget(o.rate, o.rampRate, o.dispatchRate, o.total, o.dwell)
+	if err := b.check(*o, cfg); err != nil {
+		return b, err
+	}
+	if b.Online > 0 {
+		if err := checkFileLimit(b.FileDescriptors); err != nil {
+			return b, err
+		}
+		if o.hostGuard {
+			sample, err := readHostSample(".")
+			if err != nil {
+				return b, err
+			}
+			if need := uint64(o.minFreeMemMiB)<<20 + b.SessionBytes; sample.memAvailableBytes < need {
+				return b, fmt.Errorf("available memory %d MiB is below the %d MiB floor plus %d MiB for %d fake-online sessions",
+					sample.memAvailableBytes>>20, o.minFreeMemMiB, b.SessionBytes>>20, b.Online)
+			}
+		}
+	}
+	return b, nil
+}
+
+func (b fleetBudget) check(o runOptions, cfg config) error {
+	switch {
+	case b.Real > 0 && cfg.RunnerImage == "":
+		return errors.New("runner_image must be a pinned digest reference when the fleet has real runners")
+	case b.Real > 0 && o.total > 100:
+		return errors.New("fleet mode is limited to 100 workflow dispatches per run")
+	case b.Real > o.maxRunners:
+		return fmt.Errorf("the fleet asks for %d real runners but --max-runners is %d", b.Real, o.maxRunners)
+	case o.duration < b.MinDuration:
+		return fmt.Errorf("--duration %s is too short; this fleet needs at least %s (fill %s, ramp %s, max(dwell %s, dispatch %s), removal %s, margin %s)",
+			o.duration, b.MinDuration, b.Fill, b.Ramp, o.dwell, b.Dispatch, b.Removal, fleetMargin)
+	}
+	return nil
+}
+
 func checkFileLimit(need uint64) error {
 	var limit syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {

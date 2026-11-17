@@ -104,6 +104,37 @@ func TestFleetCleanupTimeoutAndFileLimit(t *testing.T) {
 	}
 }
 
+func TestFleetBudgetCheck(t *testing.T) {
+	cfg := config{RunnerImage: "ghcr.io/actions/actions-runner@sha256:abc"}
+	o := runOptions{total: 10, maxRunners: 20, duration: time.Hour, dwell: 10 * time.Minute}
+	ok := fleetBudget{Real: 20, MinDuration: time.Hour}
+	if err := ok.check(o, cfg); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]struct {
+		b    fleetBudget
+		o    runOptions
+		cfg  config
+		want string
+	}{
+		"no image":      {ok, o, config{}, "runner_image"},
+		"too many runs": {ok, runOptions{total: 101, maxRunners: 20, duration: time.Hour}, cfg, "100 workflow dispatches"},
+		"max runners":   {fleetBudget{Real: 21}, o, cfg, "--max-runners is 20"},
+		"short":         {fleetBudget{Fake: 1, MinDuration: time.Hour + time.Second}, o, cfg, "needs at least 1h0m1s"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := tc.b.check(tc.o, tc.cfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("check() = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+	fakeOnly := fleetBudget{Fake: 100, MinDuration: time.Minute}
+	if err := fakeOnly.check(runOptions{total: 500, maxRunners: 1, duration: time.Hour}, config{}); err != nil {
+		t.Fatalf("fake-only fleet needs no image or dispatch limit: %v", err)
+	}
+}
+
 // fakeFleetSDK adds the Actions-service group lookup and scale-set create to
 // fakeScaleSets, resolving groups from the REST fake.
 type fakeFleetSDK struct {

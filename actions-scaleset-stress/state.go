@@ -65,6 +65,47 @@ type workflowRecord struct {
 	// runner group's real scale set; jobs must run on that group's runners.
 	RunnerLabel string `json:"runner_label,omitempty"`
 	Group       string `json:"group,omitempty"`
+	// Outcome is the verified result once completed: workflowPassed,
+	// workflowIntentionalFailure or workflowFailed.
+	Outcome string `json:"outcome,omitempty"`
+}
+
+const (
+	workflowPassed             = "passed"
+	workflowIntentionalFailure = "intentional_failure"
+	workflowFailed             = "failed"
+)
+
+// fleetGroupResult is one runner group's outcome in a fleet run's report.
+// Peak values come from the per-minute status samples.
+type fleetGroupResult struct {
+	Name               string           `json:"name"`
+	ID                 int64            `json:"id"`
+	Created            bool             `json:"created"`
+	ExistingRunners    int              `json:"existing_runners,omitempty"`
+	Real               int              `json:"real"`
+	Online             int              `json:"online"`
+	Offline            int              `json:"offline"`
+	FakeRegistered     int              `json:"fake_registered"`
+	FakeErrors         int              `json:"fake_registration_errors,omitempty"`
+	CeilingReason      string           `json:"ceiling_reason,omitempty"`
+	PeakSessionsOpen   int64            `json:"peak_sessions_open"`
+	SessionOpenFailed  int64            `json:"session_open_failed,omitempty"`
+	Polls              int64            `json:"polls"`
+	PollErrors         int64            `json:"poll_errors,omitempty"`
+	UnexpectedMessages int64            `json:"unexpected_messages"`
+	UnexpectedTypes    map[string]int64 `json:"unexpected_message_types,omitempty"`
+	PeakRealRegistered int              `json:"peak_real_registered"`
+	PeakRealBusy       int              `json:"peak_real_busy"`
+	PeakFakeRegistered int              `json:"peak_fake_registered"`
+	PeakFakeIdle       int              `json:"peak_fake_idle"`
+	PeakGroupRunners   int              `json:"peak_group_runners"`
+	Dispatched         int              `json:"dispatched,omitempty"`
+	Passed             int              `json:"passed,omitempty"`
+	IntentionalFails   int              `json:"intentional_failures,omitempty"`
+	Failed             int              `json:"failed,omitempty"`
+	Unresolved         int              `json:"unresolved,omitempty"`
+	LastError          string           `json:"last_error,omitempty"`
 }
 
 func (r workflowRecord) workload() string {
@@ -97,6 +138,7 @@ type runData struct {
 	ScaleSetRemoved     bool                `json:"scale_set_removed,omitempty"`
 	RunnerGroups        []runnerGroupRecord `json:"runner_groups,omitempty"`
 	ScaleSets           []scaleSetRecord    `json:"scale_sets,omitempty"`
+	FleetGroups         []fleetGroupResult  `json:"fleet_groups,omitempty"`
 	Workflows           []workflowRecord    `json:"workflows,omitempty"`
 	Attempts            int                 `json:"attempts"`
 	Accepted            int                 `json:"accepted"`
@@ -338,6 +380,7 @@ func (s *runState) snapshot() runData {
 	result.ContainerIDs = append([]string(nil), s.data.ContainerIDs...)
 	result.RunnerGroups = append([]runnerGroupRecord(nil), s.data.RunnerGroups...)
 	result.ScaleSets = append([]scaleSetRecord(nil), s.data.ScaleSets...)
+	result.FleetGroups = append([]fleetGroupResult(nil), s.data.FleetGroups...)
 	result.Workflows = append([]workflowRecord(nil), s.data.Workflows...)
 	return result
 }

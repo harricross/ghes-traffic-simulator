@@ -157,13 +157,20 @@ type runOptions struct {
 	minFreeDiskMiB     int64
 	maxLoadPerCPU      float64
 	workerReserveMiB   int64
+	fleetPath          string
+	fleet              fleetSpec
+	openConcurrency    int
+	dispatchRate       float64
 }
 
 func commandRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	o := &runOptions{}
 	common := addCommonFlags(fs)
-	fs.StringVar(&o.mode, "mode", "", "required profile: registrations, workflows or hold (bulk registered-only runners held for a long dwell)")
+	fs.StringVar(&o.mode, "mode", "", "required profile: registrations, workflows, hold (bulk registered-only runners held for a long dwell) or fleet (runner groups mixing real and fake runners; needs --fleet)")
+	fs.StringVar(&o.fleetPath, "fleet", "", "fleet mode: JSON spec of runner groups and their real, online and offline runner counts")
+	fs.IntVar(&o.openConcurrency, "open-concurrency", 6, "fleet mode: concurrent session opens for fake-online runners")
+	fs.Float64Var(&o.dispatchRate, "dispatch-rate", 0.5, "fleet mode: maximum workflow dispatches per second")
 	fs.StringVar(&o.workload, "workload", workloadSynthetic, "workflows mode: synthetic (matrix sleep jobs) or ci (Lint, sharded unit tests, Build)")
 	fs.StringVar(&o.runID, "run-id", "", "run identifier (default: generated)")
 	fs.DurationVar(&o.duration, "duration", time.Minute, "hard maximum run duration")
@@ -193,8 +200,8 @@ func commandRun(args []string) error {
 		return err
 	}
 	o.commonOptions = *common
-	if o.mode != "registrations" && o.mode != "workflows" && o.mode != modeHold {
-		return errors.New("--mode must be registrations, workflows or hold")
+	if o.mode != "registrations" && o.mode != "workflows" && o.mode != modeHold && o.mode != modeFleet {
+		return errors.New("--mode must be registrations, workflows, hold or fleet")
 	}
 	if err := o.validate(); err != nil {
 		return err
@@ -206,6 +213,12 @@ func commandRun(args []string) error {
 	target, err := newTarget(cfg, token, o.caCert, o.insecure)
 	if err != nil {
 		return err
+	}
+	var fleetPlan fleetBudget
+	if o.mode == modeFleet {
+		if fleetPlan, err = prepareFleetOptions(o, cfg); err != nil {
+			return err
+		}
 	}
 	if o.mode == "workflows" && cfg.RunnerImage == "" {
 		return errors.New("runner_image must be a pinned digest reference for workflow mode")
@@ -234,14 +247,14 @@ func commandRun(args []string) error {
 		return err
 	}
 	defer state.Close()
-	if o.mode == "workflows" {
+	if o.mode == "workflows" || o.mode == modeFleet {
 		if err := state.update(func(data *runData) { data.Workload = o.workload }); err != nil {
 			return err
 		}
 	}
 	fmt.Printf("Run %s started (mode=%s, duration=%s, total=%d)\n", o.runID, o.mode, o.duration, o.total)
 	var guard *guardProcess
-	if o.mode == "workflows" {
+	if o.mode == "workflows" || (o.mode == modeFleet && fleetPlan.Real > 0) {
 		guard, err = startGuard(state)
 		if err != nil {
 			_ = state.record("guard_start_failed", map[string]any{"error": err.Error()})
@@ -252,7 +265,13 @@ func commandRun(args []string) error {
 	heartbeatDone := make(chan error, 1)
 	go state.heartbeat(heartbeatCtx, heartbeatDone)
 	workDone := make(chan error, 1)
-	go func() { workDone <- runWorkload(ctx, target, state, *o) }()
+	go func() {
+		if o.mode == modeFleet {
+			workDone <- runFleet(ctx, target, state, *o, fleetPlan)
+			return
+		}
+		workDone <- runWorkload(ctx, target, state, *o)
+	}()
 	var workErr error
 	select {
 	case workErr = <-workDone:
@@ -268,7 +287,11 @@ func commandRun(args []string) error {
 	if heartbeatErr, ok := <-heartbeatDone; ok && heartbeatErr != nil {
 		workErr = errors.Join(workErr, heartbeatErr)
 	}
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	cleanupTimeout := 10 * time.Minute
+	if o.mode == modeFleet {
+		cleanupTimeout = fleetCleanupTimeout(fleetPlan.Real + fleetPlan.Fake)
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	cleanupErr := cleanupRun(cleanupCtx, target, state)
 	cleanupCancel()
 	if err := state.update(func(data *runData) {
@@ -289,7 +312,7 @@ func commandRun(args []string) error {
 		_ = state.record("run_stopped", map[string]any{"reason": ctx.Err().Error()})
 	}
 	printScaleSummary(os.Stdout, o.mode, state.snapshot().Scale)
-	if o.mode == "workflows" {
+	if o.mode == "workflows" || (o.mode == modeFleet && fleetPlan.Real > 0) {
 		summary := state.snapshot()
 		fmt.Printf("Workflow runs (%s): %d dispatched, %d passed, %d failed intentionally as requested, %d failed verification, %d unresolved\n",
 			o.workload, summary.Attempts, summary.Passed, summary.IntentionalFailures, summary.Failed, summary.Unresolved)
@@ -329,10 +352,10 @@ func (o runOptions) validate() error {
 		return errors.New("--rate must be > 0 and <= 100 operations per second")
 	case o.maxInflight <= 0 || o.maxInflight > 1000:
 		return errors.New("--max-inflight must be between 1 and 1000")
-	case o.dwell < 0 || (o.mode != modeHold && o.dwell > time.Hour) || o.dwell > 24*time.Hour:
-		return errors.New("--dwell must be between 0 and 1h (hold mode: 24h)")
-	case o.mode == modeHold && o.dwell >= o.duration:
-		return errors.New("--duration must exceed --dwell in hold mode so registration and removal have time to finish")
+	case o.dwell < 0 || (o.mode != modeHold && o.mode != modeFleet && o.dwell > time.Hour) || o.dwell > 24*time.Hour:
+		return errors.New("--dwell must be between 0 and 1h (hold and fleet modes: 24h)")
+	case (o.mode == modeHold || o.mode == modeFleet) && o.dwell >= o.duration:
+		return errors.New("--duration must exceed --dwell in hold and fleet modes so registration and removal have time to finish")
 	case o.maxRunners <= 0 || o.maxRunners > 1000:
 		return errors.New("--max-runners must be between 1 and 1000")
 	case o.standingRunners < 0 || o.standingRunners > 1000:
@@ -361,12 +384,18 @@ func (o runOptions) validate() error {
 		return errors.New("--max-outstanding-jobs must be between 1 and 2500")
 	case o.workload != workloadSynthetic && o.workload != workloadCI:
 		return errors.New("--workload must be synthetic or ci")
-	case o.mode != "workflows" && o.workload != workloadSynthetic:
-		return errors.New("--workload applies only to --mode workflows")
-	case o.mode == "workflows" && o.maxOutstandingJobs < jobsPerDispatch(o.workload, o.jobsPerRun):
+	case o.mode != "workflows" && o.mode != modeFleet && o.workload != workloadSynthetic:
+		return errors.New("--workload applies only to --mode workflows or fleet")
+	case (o.mode == "workflows" || o.mode == modeFleet) && o.maxOutstandingJobs < jobsPerDispatch(o.workload, o.jobsPerRun):
 		return fmt.Errorf("--max-outstanding-jobs must fit at least one full workflow dispatch (%d jobs)", jobsPerDispatch(o.workload, o.jobsPerRun))
-	case o.mode == "workflows" && len(o.runID) > 59:
-		return errors.New("workflow mode requires --run-id to be at most 59 characters so generated markers stay within the workflow limit")
+	case (o.mode == "workflows" || o.mode == modeFleet) && len(o.runID) > 59:
+		return errors.New("workflow and fleet modes require --run-id to be at most 59 characters so generated markers stay within the workflow limit")
+	case (o.mode == modeFleet) != (o.fleetPath != ""):
+		return errors.New("--fleet is required with --mode fleet and applies only to it")
+	case o.mode == modeFleet && (o.openConcurrency <= 0 || o.openConcurrency > 64):
+		return errors.New("--open-concurrency must be between 1 and 64")
+	case o.mode == modeFleet && (o.dispatchRate <= 0 || o.dispatchRate > 10):
+		return errors.New("--dispatch-rate must be > 0 and <= 10 dispatches per second")
 	case o.runnerMemoryMiB < 256 || o.runnerMemoryMiB > 65536:
 		return errors.New("--runner-memory-mib must be between 256 and 65536")
 	case o.runnerCPUs <= 0 || o.runnerCPUs > 32:
