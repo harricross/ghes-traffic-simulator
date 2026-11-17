@@ -508,3 +508,48 @@ func TestDispatchAndObserveFailsWhenAnyListenerExits(t *testing.T) {
 		t.Fatalf("error = %v, want the g2 listener exit", err)
 	}
 }
+
+func TestMarkLostDispatchesSettlesOnlyOldUndiscoveredDispatches(t *testing.T) {
+	now := time.Now().UTC()
+	old := now.Add(-lostDispatchAge - time.Minute)
+	for _, tc := range []struct {
+		name     string
+		runs     int // padding runs beyond the one that matches "found"
+		wantLost bool
+	}{
+		{name: "complete discovery", runs: 0, wantLost: true},
+		{name: "possibly truncated discovery", runs: maxWorkflowRunPages*100 - 1, wantLost: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, state := newPoolTestTarget(t, http.NotFoundHandler())
+			if err := state.update(func(data *runData) {
+				data.Workflows = []workflowRecord{
+					{Marker: "run-0001", CreatedAt: old, Status: "dispatching"},
+					{Marker: "run-0002", CreatedAt: now, Status: "dispatching"},
+					{Marker: "run-0003", CreatedAt: old, Status: "awaiting_discovery"},
+					{Marker: "run-0004", ID: 9, CreatedAt: old, Status: "queued"},
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			runs := []apiWorkflowRun{{ID: 10, DisplayTitle: "CI checks run-0003", Status: "queued"}}
+			for i := range tc.runs {
+				runs = append(runs, apiWorkflowRun{ID: int64(100 + i), DisplayTitle: "other"})
+			}
+			if err := markLostDispatches(state, runs, now); err != nil {
+				t.Fatal(err)
+			}
+			got := map[string]string{}
+			for _, w := range state.snapshot().Workflows {
+				got[w.Marker] = w.Status + "/" + w.Conclusion
+			}
+			want := map[string]string{"run-0001": "dispatching/", "run-0002": "dispatching/", "run-0003": "awaiting_discovery/", "run-0004": "queued/"}
+			if tc.wantLost {
+				want["run-0001"] = "completed/" + workflowNotCreated
+			}
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("workflows = %v, want %v", got, want)
+			}
+		})
+	}
+}

@@ -76,6 +76,9 @@ const (
 	workflowPassed             = "passed"
 	workflowIntentionalFailure = "intentional_failure"
 	workflowFailed             = "failed"
+	// workflowNotCreated is the conclusion cleanup records for a dispatch
+	// whose run never appeared; its outcome stays unresolved.
+	workflowNotCreated = "not_created"
 )
 
 // fleetGroupResult is one runner group's outcome in a fleet run's report.

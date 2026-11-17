@@ -598,6 +598,9 @@ func pollWorkflowRuns(ctx context.Context, t *target, state *runState, since tim
 	return outstanding, nil
 }
 
+// maxWorkflowRunPages bounds workflow run discovery, at 100 runs a page.
+const maxWorkflowRunPages = 10
+
 func workflowRunsForState(ctx context.Context, t *target, state runData, since time.Time) ([]apiWorkflowRun, error) {
 	byFile := make(map[string][]workflowRecord)
 	var files []string
@@ -612,7 +615,7 @@ func workflowRunsForState(ctx context.Context, t *target, state runData, since t
 	for _, file := range files {
 		records := byFile[file]
 		found := make(map[string]bool, len(records))
-		for page := 1; page <= 10; page++ {
+		for page := 1; page <= maxWorkflowRunPages; page++ {
 			pageRuns, err := t.api.workflowRuns(ctx, t.cfg, file, since, page)
 			if err != nil {
 				return nil, err

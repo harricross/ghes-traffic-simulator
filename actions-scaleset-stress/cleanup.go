@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -139,6 +140,9 @@ func cancelActiveWorkflows(ctx context.Context, t *target, state *runState, drai
 	if err != nil {
 		failures = append(failures, fmt.Errorf("discover workflow runs before cleanup: %w", err))
 	} else {
+		if err := markLostDispatches(state, runs, time.Now()); err != nil {
+			failures = append(failures, err)
+		}
 		for _, run := range runs {
 			marker := matchingMarker(run, snapshot.Workflows)
 			if marker == "" {
@@ -195,6 +199,37 @@ func cancelActiveWorkflows(ctx context.Context, t *target, state *runState, drai
 		}
 	}
 	return errors.Join(failures...)
+}
+
+// lostDispatchAge is how long cleanup waits for the run of a dispatch with an
+// ambiguous result before treating the dispatch as never created.
+const lostDispatchAge = 10 * time.Minute
+
+// markLostDispatches settles dispatches that have no run ID and still no
+// matching run lostDispatchAge after they were sent, so an interrupted
+// dispatch request cannot retain the run's scale sets forever. runs is the
+// discovery result; one that may have been truncated settles nothing.
+func markLostDispatches(state *runState, runs []apiWorkflowRun, now time.Time) error {
+	if len(runs) >= maxWorkflowRunPages*100 {
+		return nil
+	}
+	for _, workflow := range state.snapshot().Workflows {
+		if workflow.ID != 0 || workflow.Status == "completed" || now.Sub(workflow.CreatedAt) < lostDispatchAge {
+			continue
+		}
+		if slices.ContainsFunc(runs, func(run apiWorkflowRun) bool {
+			return matchingMarker(run, []workflowRecord{workflow}) != ""
+		}) {
+			continue
+		}
+		if err := updateWorkflow(state, workflow.Marker, 0, "completed", workflowNotCreated); err != nil {
+			return err
+		}
+		if err := state.record("workflow_dispatch_not_created", map[string]any{"marker": workflow.Marker}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func markRunnerRemoved(state *runState, id int, name string) error {
