@@ -44,6 +44,8 @@ func execute(args []string) error {
 		return commandRun(args[1:])
 	case "cleanup":
 		return commandCleanup(args[1:])
+	case "probe-online":
+		return commandProbeOnline(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q (run help)", args[0])
 	}
@@ -57,6 +59,7 @@ Usage:
   actions-scaleset-stress prepare --config <file>
   actions-scaleset-stress run     --config <file> --mode registrations|workflows|hold [--workload synthetic|ci] [limits]
   actions-scaleset-stress cleanup --config <file> --run-id <id> [--apply]
+  actions-scaleset-stress probe-online --config <file> [--runners 3] [--hold 90s]   (spike: protocol-only online sessions)
 
 The GHES token is read from the environment variable named by token_env in
 the non-secret JSON config (default: GHES_ACTIONS_TOKEN). No command starts

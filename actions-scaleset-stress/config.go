@@ -37,6 +37,7 @@ type target struct {
 	token     string
 	api       *ghesAPI
 	scaleSet  *scaleset.Client
+	transport http.RoundTripper
 	identity  string
 	repoState string
 	ready     bool
@@ -143,13 +144,13 @@ func newTarget(cfg config, token, caCert string, insecure bool) (*target, error)
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	roots := (*x509.CertPool)(nil)
+	var roots *x509.CertPool
 	if caCert != "" {
 		pem, err := os.ReadFile(caCert)
 		if err != nil {
 			return nil, fmt.Errorf("read CA certificate: %w", err)
 		}
-		roots, err := x509.SystemCertPool()
+		roots, err = x509.SystemCertPool()
 		if err != nil || roots == nil {
 			roots = x509.NewCertPool()
 		}
@@ -181,7 +182,7 @@ func newTarget(cfg config, token, caCert string, insecure bool) (*target, error)
 	apiClient := *httpClient
 	apiClient.Timeout = 30 * time.Second
 	api := newGHESAPI(cfg.APIBaseURL, token, &apiClient)
-	return &target{cfg: cfg, token: token, api: api, scaleSet: sdkClient}, nil
+	return &target{cfg: cfg, token: token, api: api, scaleSet: sdkClient, transport: transport}, nil
 }
 
 func isHostedGitHub(host string) bool {
