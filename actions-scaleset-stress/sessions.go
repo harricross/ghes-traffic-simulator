@@ -39,6 +39,7 @@ const (
 	// sessionMessageBackoff paces polling after an unexpected message, which
 	// the server may redeliver because a fake runner never handles it.
 	sessionMessageBackoff = 5 * time.Second
+	sessionOpenBackoff    = 2 * time.Second
 )
 
 type flexInt int64
@@ -304,6 +305,9 @@ type probeRunner struct {
 	counters *sessionCounters
 	// messageBackoff pauses polling after a message; zero polls again at once.
 	messageBackoff time.Duration
+	// openBackoff is the step between session open attempts; zero means
+	// sessionOpenBackoff.
+	openBackoff time.Duration
 	// jobs, when set, makes the runner accept and complete one job.
 	jobs *fakeJobConfig
 	// fatal reports a fake-job failure that should stop the run.
@@ -381,8 +385,9 @@ func (r *probeRunner) openSession(ctx context.Context) error {
 		return fmt.Errorf("create session returned HTTP %d: %s", status, snippet(data))
 	}
 	var out struct {
-		SessionID     string                `json:"sessionId"`
-		EncryptionKey *sessionEncryptionKey `json:"encryptionKey"`
+		SessionID         string                `json:"sessionId"`
+		EncryptionKey     *sessionEncryptionKey `json:"encryptionKey"`
+		UseFipsEncryption flexBool              `json:"useFipsEncryption"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil || out.SessionID == "" {
 		return errors.New("create session response has no sessionId")
@@ -390,7 +395,7 @@ func (r *probeRunner) openSession(ctx context.Context) error {
 	r.sessionID = out.SessionID
 	if r.jobs != nil {
 		// Only job messages are decrypted, so other runners skip the key.
-		key, err := decodeSessionKey(r.jit.key, out.EncryptionKey)
+		key, err := decodeSessionKey(r.jit.key, out.EncryptionKey, bool(out.UseFipsEncryption))
 		if err != nil {
 			return err
 		}
@@ -530,10 +535,14 @@ func (r *probeRunner) closeSession(ctx context.Context) error {
 }
 
 func (r *probeRunner) openWithRetry(ctx context.Context) error {
+	backoff := r.openBackoff
+	if backoff <= 0 {
+		backoff = sessionOpenBackoff
+	}
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
 		if attempt > 0 {
-			sleepCtx(ctx, time.Duration(attempt)*2*time.Second)
+			sleepCtx(ctx, time.Duration(attempt)*backoff)
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -655,6 +664,7 @@ type sessionManager struct {
 	openSem          chan struct{}
 	closeConcurrency int
 	messageBackoff   time.Duration
+	openBackoff      time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -735,7 +745,7 @@ func (m *sessionManager) add(ctx context.Context, group string, runnerID int, ru
 	counters.requested.Add(1)
 	r := &probeRunner{
 		name: runnerName, id: runnerID, http: m.http, owner: m.owner, ver: m.version,
-		counters: counters, messageBackoff: m.messageBackoff,
+		counters: counters, messageBackoff: m.messageBackoff, openBackoff: m.openBackoff,
 		jobs: m.jobs[group], fatal: m.reportFatal,
 	}
 	r.setStage("queued")
@@ -759,9 +769,10 @@ func (m *sessionManager) run(ctx context.Context, r *probeRunner, encodedJIT str
 	stop := context.AfterFunc(ctx, cancel)
 	err = m.open(openCtx, r)
 	stop()
+	cancelled := openCtx.Err() != nil
 	cancel()
 	if err != nil {
-		if openCtx.Err() != nil {
+		if cancelled {
 			r.setStage("cancelled")
 		} else {
 			m.openFailed(r, err)

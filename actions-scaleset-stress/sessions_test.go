@@ -75,6 +75,7 @@ type fakeSessionServer struct {
 	message         map[string]string         // client -> message type delivered once
 	rawMessage      map[string]map[string]any // client -> whole message delivered once
 	sessionKey      []byte                    // returned RSA-encrypted when set
+	fips            bool                      // encrypt sessionKey with OAEP-SHA256 and say so
 	revokeFirstPoll map[string]bool
 	unknown         []string
 }
@@ -122,7 +123,12 @@ func (f *fakeSessionServer) serve(w http.ResponseWriter, r *http.Request) {
 		f.sessions[id] = client
 		resp := map[string]any{"sessionId": id}
 		if f.sessionKey != nil {
-			encrypted, err := rsa.EncryptOAEP(sha1.New(), rand.Reader, &testRunnerKey().PublicKey, f.sessionKey, nil)
+			hash := sha1.New()
+			if f.fips {
+				hash = sha256.New()
+				resp["useFipsEncryption"] = true
+			}
+			encrypted, err := rsa.EncryptOAEP(hash, rand.Reader, &testRunnerKey().PublicKey, f.sessionKey, nil)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
@@ -208,6 +214,34 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+func TestSessionManagerCountsFailedOpens(t *testing.T) {
+	fake := newFakeSessionServer(t)
+	fake.handle = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/sessions") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}
+	m := newSessionManager(fake.srv.Client(), 1, "2.338.0", nil)
+	m.openBackoff = time.Millisecond
+	m.add(context.Background(), "g01", 101, "fake-1", encodeTestJIT(t, fake.srv.URL, "client-1", 101))
+
+	deadline := time.Now().Add(10 * time.Second)
+	for s := m.stats()["g01"]; s.OpenFailed != 1; s = m.stats()["g01"] {
+		if time.Now().After(deadline) {
+			t.Fatalf("a failed open was not counted: %+v", s)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if s := m.stats()["g01"]; !strings.Contains(s.LastError, "HTTP 500") {
+		t.Fatalf("last error %q, want the session create failure", s.LastError)
+	}
+	if err := m.closeAll(context.Background()); err != nil {
+		t.Fatalf("closeAll: %v", err)
+	}
 }
 
 func TestSessionManagerKeepsFakeRunnersIdleAndClosesSessions(t *testing.T) {

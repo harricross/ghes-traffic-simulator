@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -38,16 +39,26 @@ func TestFakeJobMessageDecryption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := decodeSessionKey(key, &sessionEncryptionKey{Encrypted: true, Value: encrypted}); err != nil || !bytes.Equal(got, aesKey) {
+	if got, err := decodeSessionKey(key, &sessionEncryptionKey{Encrypted: true, Value: encrypted}, false); err != nil || !bytes.Equal(got, aesKey) {
 		t.Fatalf("decodeSessionKey(encrypted) = %x, %v", got, err)
 	}
-	if got, err := decodeSessionKey(key, &sessionEncryptionKey{Value: aesKey}); err != nil || !bytes.Equal(got, aesKey) {
+	fipsEncrypted, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, &key.PublicKey, aesKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := decodeSessionKey(key, &sessionEncryptionKey{Encrypted: true, Value: fipsEncrypted}, true); err != nil || !bytes.Equal(got, aesKey) {
+		t.Fatalf("decodeSessionKey(FIPS) = %x, %v", got, err)
+	}
+	if _, err := decodeSessionKey(key, &sessionEncryptionKey{Encrypted: true, Value: fipsEncrypted}, false); err == nil {
+		t.Fatal("a FIPS key must not decrypt with OAEP-SHA1")
+	}
+	if got, err := decodeSessionKey(key, &sessionEncryptionKey{Value: aesKey}, false); err != nil || !bytes.Equal(got, aesKey) {
 		t.Fatalf("decodeSessionKey(plain) = %x, %v", got, err)
 	}
-	if got, err := decodeSessionKey(key, nil); got != nil || err != nil {
+	if got, err := decodeSessionKey(key, nil, false); got != nil || err != nil {
 		t.Fatalf("decodeSessionKey(nil) = %x, %v", got, err)
 	}
-	if _, err := decodeSessionKey(key, &sessionEncryptionKey{Encrypted: true, Value: aesKey}); err == nil {
+	if _, err := decodeSessionKey(key, &sessionEncryptionKey{Encrypted: true, Value: aesKey}, false); err == nil {
 		t.Fatal("a key not encrypted for the runner must be rejected")
 	}
 
@@ -196,6 +207,7 @@ func testJobMessage(t *testing.T, serverURL string, aesKey []byte, planVersion i
 func TestFakeRunnerRunsJobAndReportsResult(t *testing.T) {
 	for name, tc := range map[string]struct {
 		planVersion   int
+		fips          bool
 		failureShards string
 		renewStatus   int
 		eventStatus   []int
@@ -204,7 +216,7 @@ func TestFakeRunnerRunsJobAndReportsResult(t *testing.T) {
 		check         func(t *testing.T, s sessionGroupStats, e *fakeJobEndpoints, replaced []string, fatal error)
 	}{
 		"failed shard retries numeric result and finishes old plan": {
-			planVersion: 7, failureShards: "[1]", renewStatus: http.StatusOK,
+			planVersion: 7, fips: true, failureShards: "[1]", renewStatus: http.StatusOK,
 			eventStatus: []int{http.StatusBadRequest},
 			done:        func(s sessionGroupStats) bool { return s.Replacements == 1 },
 			check: func(t *testing.T, s sessionGroupStats, e *fakeJobEndpoints, replaced []string, fatal error) {
@@ -253,6 +265,7 @@ func TestFakeRunnerRunsJobAndReportsResult(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			fake := newFakeSessionServer(t)
 			fake.sessionKey = bytes.Repeat([]byte{5}, 32)
+			fake.fips = tc.fips
 			endpoints := &fakeJobEndpoints{sessions: fake, renewStatus: tc.renewStatus, eventStatus: tc.eventStatus}
 			fake.handle = endpoints.handle
 			fake.rawMessage["client-1"] = testJobMessage(t, fake.srv.URL, fake.sessionKey, tc.planVersion, tc.failureShards)

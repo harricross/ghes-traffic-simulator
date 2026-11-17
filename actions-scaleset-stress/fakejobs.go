@@ -15,6 +15,7 @@ import (
 	"crypto/cipher"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -77,15 +78,20 @@ type sessionEncryptionKey struct {
 }
 
 // decodeSessionKey returns the AES key that encrypts this session's
-// messages, or nil when the server sent none.
-func decodeSessionKey(key *rsa.PrivateKey, k *sessionEncryptionKey) ([]byte, error) {
+// messages, or nil when the server sent none. Like the runner, it uses the
+// server's useFipsEncryption reply to choose OAEP-SHA256 over OAEP-SHA1.
+func decodeSessionKey(key *rsa.PrivateKey, k *sessionEncryptionKey, fips bool) ([]byte, error) {
 	if k == nil || len(k.Value) == 0 {
 		return nil, nil
 	}
 	if !bool(k.Encrypted) {
 		return k.Value, nil
 	}
-	plain, err := rsa.DecryptOAEP(sha1.New(), nil, key, k.Value, nil)
+	hash := sha1.New()
+	if fips {
+		hash = sha256.New()
+	}
+	plain, err := rsa.DecryptOAEP(hash, nil, key, k.Value, nil)
 	if err != nil {
 		return nil, errors.New("session encryption key could not be decrypted with the runner key")
 	}
