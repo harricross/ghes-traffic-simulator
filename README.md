@@ -150,7 +150,8 @@ remaining enabled operations:
 ## Stress GitHub Actions on GHES
 
 [`actions-scaleset-stress`](actions-scaleset-stress/README.md) provides bounded
-runner-registration churn and synthetic workflow execution against a real
+runner-registration churn and workflow execution (a synthetic matrix or a
+lint/test/build CI pipeline) against a real
 GHES appliance. It uses GitHub's official scale-set SDK and, for workflow
 load, trusted digest-pinned runner containers; it does not emulate GHES.
 Configure a disposable private repository, run `check` and `prepare`, then

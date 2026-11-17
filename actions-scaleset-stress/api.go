@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -82,12 +82,6 @@ type apiRepo struct {
 	DefaultBranch string `json:"default_branch"`
 }
 
-type apiContent struct {
-	SHA      string `json:"sha"`
-	Content  string `json:"content"`
-	Encoding string `json:"encoding"`
-}
-
 type apiWorkflowRun struct {
 	ID           int64     `json:"id"`
 	Name         string    `json:"name"`
@@ -129,9 +123,34 @@ func (t *target) checkAuthenticated(ctx context.Context) error {
 		return err
 	}
 	t.identity = user
-	t.repoState = "not yet checked"
+	t.ready = false
 	t.repoState = fmt.Sprintf("ready for GHES %s", version)
 	return nil
+}
+
+// verifyRepository checks the configured repository is the expected private,
+// Actions-enabled target on its default branch. found is false on HTTP 404.
+func (t *target) verifyRepository(ctx context.Context, repo *apiRepo) (bool, error) {
+	status, err := t.api.request(ctx, http.MethodGet, repositoryPath(t.cfg.Owner, t.cfg.Repo), nil, repo, http.StatusOK, http.StatusNotFound)
+	if err != nil || status == http.StatusNotFound {
+		return false, err
+	}
+	if !repo.Private || !strings.EqualFold(repo.FullName, t.cfg.Owner+"/"+t.cfg.Repo) {
+		return true, errors.New("configured repository is not the expected private target")
+	}
+	if repo.DefaultBranch != t.cfg.Ref {
+		return true, fmt.Errorf("configured ref %q must match repository default branch %q", t.cfg.Ref, repo.DefaultBranch)
+	}
+	var permissions struct {
+		Enabled bool `json:"enabled"`
+	}
+	if _, err := t.api.request(ctx, http.MethodGet, repositoryPath(t.cfg.Owner, t.cfg.Repo)+"/actions/permissions", nil, &permissions, http.StatusOK); err != nil {
+		return true, fmt.Errorf("read repository Actions permissions: %w", err)
+	}
+	if !permissions.Enabled {
+		return true, errors.New("GitHub Actions is disabled for the target repository; enable it through the approved repository settings")
+	}
+	return true, nil
 }
 
 func (t *target) check(ctx context.Context) error {
@@ -139,60 +158,41 @@ func (t *target) check(ctx context.Context) error {
 		return err
 	}
 	var repo apiRepo
-	status, err := t.api.request(ctx, http.MethodGet, repositoryPath(t.cfg.Owner, t.cfg.Repo), nil, &repo, http.StatusOK, http.StatusNotFound)
+	found, err := t.verifyRepository(ctx, &repo)
 	if err != nil {
 		return err
 	}
-	if status == http.StatusNotFound {
+	if !found {
 		t.repoState = "not found (run prepare to create the private target)"
 		return nil
 	}
-	if !repo.Private || !strings.EqualFold(repo.FullName, t.cfg.Owner+"/"+t.cfg.Repo) {
-		return errors.New("configured repository is not the expected private target")
-	}
-	if repo.DefaultBranch != t.cfg.Ref {
-		return fmt.Errorf("configured ref %q does not match repository default branch %q", t.cfg.Ref, repo.DefaultBranch)
-	}
-	var permissions struct {
-		Enabled bool `json:"enabled"`
-	}
-	if _, err := t.api.request(ctx, http.MethodGet, repositoryPath(t.cfg.Owner, t.cfg.Repo)+"/actions/permissions", nil, &permissions, http.StatusOK); err != nil {
-		return fmt.Errorf("read repository Actions permissions: %w", err)
-	}
-	if !permissions.Enabled {
-		return errors.New("GitHub Actions is disabled for the target repository")
-	}
-	contentURL := repositoryPath(t.cfg.Owner, t.cfg.Repo) + "/contents/" + escapeAPIPath(t.cfg.WorkflowFile) + "?ref=" + url.QueryEscape(t.cfg.Ref)
-	var content apiContent
-	status, err = t.api.request(ctx, http.MethodGet, contentURL, nil, &content, http.StatusOK, http.StatusNotFound)
+	snapshot, err := t.managedSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	if status == http.StatusNotFound {
-		t.repoState = "repository exists; workflow is missing (run prepare)"
+	if len(snapshot.missing) > 0 {
+		t.repoState = fmt.Sprintf("repository exists; %d of %d managed files are missing (run prepare)", len(snapshot.missing), snapshot.total)
 		return nil
 	}
-	if content.Encoding != "base64" {
-		return errors.New("workflow file has an unsupported content encoding")
+	for _, file := range []string{t.cfg.WorkflowFile, ciWorkflowFile} {
+		var workflow struct {
+			State string `json:"state"`
+		}
+		workflowPath := repositoryPath(t.cfg.Owner, t.cfg.Repo) + "/actions/workflows/" + url.PathEscape(file)
+		status, err := t.api.request(ctx, http.MethodGet, workflowPath, nil, &workflow, http.StatusOK, http.StatusNotFound)
+		if err != nil {
+			return fmt.Errorf("verify workflow %s is registered: %w", file, err)
+		}
+		if status == http.StatusNotFound {
+			t.repoState = fmt.Sprintf("workflow %s is committed but not registered yet", file)
+			return nil
+		}
+		if workflow.State != "active" {
+			return fmt.Errorf("workflow %s state is %q, not active", file, workflow.State)
+		}
 	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(content.Content), ""))
-	if err != nil {
-		return fmt.Errorf("decode workflow file: %w", err)
-	}
-	if string(decoded) != workflowYAML(t.cfg.ScaleSetName) {
-		return errors.New("workflow file differs from the generated Actions load template; refusing to run")
-	}
-	var workflow struct {
-		State string `json:"state"`
-	}
-	workflowPath := repositoryPath(t.cfg.Owner, t.cfg.Repo) + "/actions/workflows/" + url.PathEscape(t.cfg.WorkflowFile)
-	if _, err := t.api.request(ctx, http.MethodGet, workflowPath, nil, &workflow, http.StatusOK); err != nil {
-		return fmt.Errorf("verify workflow is registered: %w", err)
-	}
-	if workflow.State != "active" {
-		return fmt.Errorf("workflow state is %q, not active", workflow.State)
-	}
-	t.repoState = "private repository, Actions enabled, workflow verified"
+	t.ready = true
+	t.repoState = fmt.Sprintf("private repository, Actions enabled, %d managed files and both workflows verified", snapshot.total)
 	return nil
 }
 
@@ -201,11 +201,14 @@ func (t *target) prepare(ctx context.Context) error {
 		return err
 	}
 	var repo apiRepo
-	status, err := t.api.request(ctx, http.MethodGet, repositoryPath(t.cfg.Owner, t.cfg.Repo), nil, &repo, http.StatusOK, http.StatusNotFound)
+	found, err := t.verifyRepository(ctx, &repo)
+	if found && err != nil {
+		return fmt.Errorf("refusing to prepare repository: %w", err)
+	}
 	if err != nil {
 		return err
 	}
-	if status == http.StatusNotFound {
+	if !found {
 		var owner struct {
 			Type string `json:"type"`
 		}
@@ -225,57 +228,141 @@ func (t *target) prepare(ctx context.Context) error {
 		}, &repo, http.StatusCreated); err != nil {
 			return fmt.Errorf("create private test repository: %w", err)
 		}
+		if found, err = t.verifyRepository(ctx, &repo); err != nil || !found {
+			return errors.Join(errors.New("verify created test repository"), err)
+		}
 	}
-	if !repo.Private || !strings.EqualFold(repo.FullName, t.cfg.Owner+"/"+t.cfg.Repo) {
-		return errors.New("refusing to prepare a repository that is not the expected private target")
+	if err := t.installManagedFiles(ctx); err != nil {
+		return err
 	}
-	if repo.DefaultBranch == "" {
-		return errors.New("repository has no default branch")
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if err := t.check(ctx); err != nil {
+			return fmt.Errorf("verify prepared repository: %w", err)
+		}
+		if t.ready {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("prepared repository is not ready: %s", t.repoState)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
-	if repo.DefaultBranch != t.cfg.Ref {
-		return fmt.Errorf("configured ref %q must match repository default branch %q for the prepared workflow", t.cfg.Ref, repo.DefaultBranch)
-	}
-	var permissions struct {
-		Enabled bool `json:"enabled"`
-	}
-	if _, err := t.api.request(ctx, http.MethodGet, repositoryPath(t.cfg.Owner, t.cfg.Repo)+"/actions/permissions", nil, &permissions, http.StatusOK); err != nil {
-		return fmt.Errorf("read repository Actions permissions: %w", err)
-	}
-	if !permissions.Enabled {
-		return errors.New("GitHub Actions is disabled for the target repository; enable it through the approved repository settings")
-	}
+}
 
-	workflow := workflowYAML(t.cfg.ScaleSetName)
-	contentPath := t.cfg.WorkflowFile
-	contentURL := repositoryPath(t.cfg.Owner, t.cfg.Repo) + "/contents/" + escapeAPIPath(contentPath)
-	var existing apiContent
-	status, err = t.api.request(ctx, http.MethodGet, contentURL+"?ref="+url.QueryEscape(repo.DefaultBranch), nil, &existing, http.StatusOK, http.StatusNotFound)
+var gitObjectID = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+type repoSnapshot struct {
+	commit  string
+	tree    string
+	missing []repoFile
+	total   int
+}
+
+// managedSnapshot compares the managed files with the default branch's tree.
+// Files with different content are a conflict: prepare never overwrites them.
+func (t *target) managedSnapshot(ctx context.Context) (repoSnapshot, error) {
+	base := repositoryPath(t.cfg.Owner, t.cfg.Repo)
+	var ref struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	status, err := t.api.request(ctx, http.MethodGet, base+"/git/ref/heads/"+escapeAPIPath(t.cfg.Ref), nil, &ref, http.StatusOK, http.StatusNotFound, http.StatusConflict)
+	if err != nil {
+		return repoSnapshot{}, fmt.Errorf("read branch %s: %w", t.cfg.Ref, err)
+	}
+	if status != http.StatusOK || !gitObjectID.MatchString(ref.Object.SHA) {
+		return repoSnapshot{}, fmt.Errorf("branch %s has no commits; initialize the repository first", t.cfg.Ref)
+	}
+	var commit struct {
+		Tree struct {
+			SHA string `json:"sha"`
+		} `json:"tree"`
+	}
+	if _, err := t.api.request(ctx, http.MethodGet, base+"/git/commits/"+ref.Object.SHA, nil, &commit, http.StatusOK); err != nil {
+		return repoSnapshot{}, fmt.Errorf("read branch head commit: %w", err)
+	}
+	if !gitObjectID.MatchString(commit.Tree.SHA) {
+		return repoSnapshot{}, errors.New("branch head commit has an invalid tree")
+	}
+	var tree struct {
+		Truncated bool `json:"truncated"`
+		Tree      []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+			SHA  string `json:"sha"`
+		} `json:"tree"`
+	}
+	if _, err := t.api.request(ctx, http.MethodGet, base+"/git/trees/"+commit.Tree.SHA+"?recursive=1", nil, &tree, http.StatusOK); err != nil {
+		return repoSnapshot{}, fmt.Errorf("read repository tree: %w", err)
+	}
+	if tree.Truncated {
+		return repoSnapshot{}, errors.New("repository tree is too large to verify; use a dedicated test repository")
+	}
+	existing := make(map[string]string, len(tree.Tree))
+	for _, entry := range tree.Tree {
+		existing[entry.Path] = entry.Type + " " + entry.SHA
+	}
+	files, err := managedFiles(t.cfg)
+	if err != nil {
+		return repoSnapshot{}, err
+	}
+	snapshot := repoSnapshot{commit: ref.Object.SHA, tree: commit.Tree.SHA, total: len(files)}
+	for _, file := range files {
+		entry, ok := existing[file.Path]
+		if !ok {
+			snapshot.missing = append(snapshot.missing, file)
+			continue
+		}
+		if entry != "blob "+gitBlobSHA(file.Content) {
+			return repoSnapshot{}, fmt.Errorf("%s differs from the generated load-test content; refusing to run or overwrite it", file.Path)
+		}
+	}
+	return snapshot, nil
+}
+
+// installManagedFiles adds every missing managed file in one fast-forward commit.
+func (t *target) installManagedFiles(ctx context.Context) error {
+	snapshot, err := t.managedSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	if status == http.StatusOK {
-		if existing.Encoding != "base64" {
-			return errors.New("existing workflow content has an unsupported encoding")
-		}
-		decoded, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(existing.Content), ""))
-		if err != nil {
-			return fmt.Errorf("decode existing workflow content: %w", err)
-		}
-		if string(decoded) != workflow {
-			return errors.New("refusing to overwrite an existing workflow that differs from the generated test workflow")
-		}
-	} else {
-		payload := map[string]any{
-			"message": "Add synthetic Actions load workflow",
-			"content": base64.StdEncoding.EncodeToString([]byte(workflow)),
-			"branch":  repo.DefaultBranch,
-		}
-		if _, err := t.api.request(ctx, http.MethodPut, contentURL, payload, nil, http.StatusCreated); err != nil {
-			return fmt.Errorf("install synthetic workflow: %w", err)
-		}
+	if len(snapshot.missing) == 0 {
+		return nil
 	}
-	if err := t.check(ctx); err != nil {
-		return fmt.Errorf("verify prepared repository and workflow: %w", err)
+	base := repositoryPath(t.cfg.Owner, t.cfg.Repo)
+	entries := make([]map[string]string, 0, len(snapshot.missing))
+	for _, file := range snapshot.missing {
+		entries = append(entries, map[string]string{"path": file.Path, "mode": "100644", "type": "blob", "content": file.Content})
+	}
+	var created struct {
+		SHA string `json:"sha"`
+	}
+	if _, err := t.api.request(ctx, http.MethodPost, base+"/git/trees", map[string]any{"base_tree": snapshot.tree, "tree": entries}, &created, http.StatusCreated); err != nil {
+		return fmt.Errorf("create tree with load-test files: %w", err)
+	}
+	if !gitObjectID.MatchString(created.SHA) {
+		return errors.New("created tree has an invalid object ID")
+	}
+	treeSHA := created.SHA
+	created.SHA = ""
+	if _, err := t.api.request(ctx, http.MethodPost, base+"/git/commits", map[string]any{
+		"message": fmt.Sprintf("Add Actions load-test workflows and CI project (%d files)", len(entries)),
+		"tree":    treeSHA,
+		"parents": []string{snapshot.commit},
+	}, &created, http.StatusCreated); err != nil {
+		return fmt.Errorf("create load-test commit: %w", err)
+	}
+	if !gitObjectID.MatchString(created.SHA) {
+		return errors.New("created commit has an invalid object ID")
+	}
+	if _, err := t.api.request(ctx, http.MethodPatch, base+"/git/refs/heads/"+escapeAPIPath(t.cfg.Ref), map[string]any{"sha": created.SHA, "force": false}, nil, http.StatusOK); err != nil {
+		return fmt.Errorf("fast-forward %s with load-test files (re-run prepare if the branch moved): %w", t.cfg.Ref, err)
 	}
 	return nil
 }
@@ -292,7 +379,7 @@ func escapeAPIPath(value string) string {
 	return strings.Join(parts, "/")
 }
 
-func (a *ghesAPI) dispatch(ctx context.Context, cfg config, marker string, shards, failures []int, duration time.Duration, logBytes int) (int64, error) {
+func (a *ghesAPI) dispatch(ctx context.Context, cfg config, workflowFile, marker string, shards, failures []int, duration time.Duration, logBytes int) (int64, error) {
 	shardJSON, _ := json.Marshal(shards)
 	failJSON, _ := json.Marshal(failures)
 	inputs := map[string]string{
@@ -305,7 +392,7 @@ func (a *ghesAPI) dispatch(ctx context.Context, cfg config, marker string, shard
 	var out struct {
 		WorkflowRunID int64 `json:"workflow_run_id"`
 	}
-	path := repositoryPath(cfg.Owner, cfg.Repo) + "/actions/workflows/" + url.PathEscape(cfg.WorkflowFile) + "/dispatches"
+	path := repositoryPath(cfg.Owner, cfg.Repo) + "/actions/workflows/" + url.PathEscape(workflowFile) + "/dispatches"
 	status, err := a.request(ctx, http.MethodPost, path, map[string]any{"ref": cfg.Ref, "inputs": inputs}, &out, http.StatusOK, http.StatusNoContent)
 	if err != nil {
 		return 0, err
@@ -393,8 +480,8 @@ jobs:
 `, "__SCALE_SET_NAME__", scaleSetName)
 }
 
-func (a *ghesAPI) workflowRuns(ctx context.Context, cfg config, since time.Time, page int) ([]apiWorkflowRun, error) {
-	path := repositoryPath(cfg.Owner, cfg.Repo) + "/actions/workflows/" + url.PathEscape(cfg.WorkflowFile) + "/runs"
+func (a *ghesAPI) workflowRuns(ctx context.Context, cfg config, workflowFile string, since time.Time, page int) ([]apiWorkflowRun, error) {
+	path := repositoryPath(cfg.Owner, cfg.Repo) + "/actions/workflows/" + url.PathEscape(workflowFile) + "/runs"
 	query := url.Values{}
 	query.Set("per_page", "100")
 	query.Set("page", strconv.Itoa(page))

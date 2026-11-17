@@ -139,7 +139,7 @@ func cancelActiveWorkflows(ctx context.Context, t *target, state *runState, drai
 	deadline := time.Now().Add(drain)
 	for time.Now().Before(deadline) {
 		pollCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		_, pollErr := pollWorkflowRuns(pollCtx, t, state, runOptions{jobsPerRun: 1}, snapshot.CreatedAt, 0)
+		_, pollErr := pollWorkflowRuns(pollCtx, t, state, snapshot.CreatedAt, 0)
 		cancel()
 		if pollErr == nil && allWorkflowsTerminal(state.snapshot().Workflows) {
 			return errors.Join(failures...)

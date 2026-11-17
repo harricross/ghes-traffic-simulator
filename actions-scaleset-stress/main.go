@@ -55,7 +55,7 @@ func printUsage(w *os.File) {
 Usage:
   actions-scaleset-stress check   --config <file>
   actions-scaleset-stress prepare --config <file>
-  actions-scaleset-stress run     --config <file> --mode registrations|workflows [limits]
+  actions-scaleset-stress run     --config <file> --mode registrations|workflows [--workload synthetic|ci] [limits]
   actions-scaleset-stress cleanup --config <file> --run-id <id> [--apply]
 
 The GHES token is read from the environment variable named by token_env in
@@ -121,14 +121,15 @@ func commandPrepare(args []string) error {
 	if err := target.prepare(ctx); err != nil {
 		return err
 	}
-	fmt.Printf("Private test repository and workflow are ready: %s/%s (%s)\n",
-		cfg.Owner, cfg.Repo, cfg.WorkflowFile)
+	fmt.Printf("Private test repository is ready: %s/%s (synthetic workflow %s, CI workflow %s, CI project %s/)\n",
+		cfg.Owner, cfg.Repo, cfg.WorkflowFile, ciWorkflowFile, ciProjectDir)
 	return nil
 }
 
 type runOptions struct {
 	commonOptions
 	mode               string
+	workload           string
 	runID              string
 	duration           time.Duration
 	total              int
@@ -152,6 +153,7 @@ func commandRun(args []string) error {
 	o := &runOptions{}
 	common := addCommonFlags(fs)
 	fs.StringVar(&o.mode, "mode", "", "required profile: registrations or workflows")
+	fs.StringVar(&o.workload, "workload", workloadSynthetic, "workflows mode: synthetic (matrix sleep jobs) or ci (Lint, sharded unit tests, Build)")
 	fs.StringVar(&o.runID, "run-id", "", "run identifier (default: generated)")
 	fs.DurationVar(&o.duration, "duration", time.Minute, "hard maximum run duration")
 	fs.IntVar(&o.total, "total", 10, "maximum registrations or workflow dispatches")
@@ -159,9 +161,9 @@ func commandRun(args []string) error {
 	fs.IntVar(&o.maxInflight, "max-inflight", 5, "maximum concurrent registration operations")
 	fs.DurationVar(&o.dwell, "dwell", 5*time.Second, "registered runner dwell before removal")
 	fs.IntVar(&o.maxRunners, "max-runners", 4, "maximum concurrent official runner containers")
-	fs.IntVar(&o.jobsPerRun, "jobs-per-run", 1, "matrix jobs in each dispatched workflow")
-	fs.DurationVar(&o.jobDuration, "job-duration", time.Second, "bounded synthetic job duration")
-	fs.IntVar(&o.failPercent, "fail-percent", 0, "deterministic intentional job failure percentage")
+	fs.IntVar(&o.jobsPerRun, "jobs-per-run", 1, "matrix jobs (synthetic) or test shards (ci) in each dispatched workflow")
+	fs.DurationVar(&o.jobDuration, "job-duration", time.Second, "bounded synthetic job or extra test-shard duration")
+	fs.IntVar(&o.failPercent, "fail-percent", 0, "percentage of dispatched workflow runs that intentionally fail one job; the rest pass")
 	fs.IntVar(&o.maxLogBytes, "max-log-bytes", 1024, "maximum synthetic log bytes per job")
 	fs.IntVar(&o.maxOutstandingJobs, "max-outstanding-jobs", 20, "maximum generated queued plus running jobs")
 	fs.Int64Var(&o.runnerMemoryMiB, "runner-memory-mib", 2048, "hard memory limit per runner container")
@@ -205,14 +207,19 @@ func commandRun(args []string) error {
 	if err := target.check(ctx); err != nil {
 		return err
 	}
-	if target.repoState != "private repository, Actions enabled, workflow verified" {
-		return fmt.Errorf("run requires a prepared private repository with an active workflow; current target state: %s", target.repoState)
+	if !target.ready {
+		return fmt.Errorf("run requires a prepared private repository with active workflows; current target state: %s", target.repoState)
 	}
 	state, err := createRunState(o.artifactsDir, o.runID, o.mode, target)
 	if err != nil {
 		return err
 	}
 	defer state.Close()
+	if o.mode == "workflows" {
+		if err := state.update(func(data *runData) { data.Workload = o.workload }); err != nil {
+			return err
+		}
+	}
 	fmt.Printf("Run %s started (mode=%s, duration=%s, total=%d)\n", o.runID, o.mode, o.duration, o.total)
 	var guard *guardProcess
 	if o.mode == "workflows" {
@@ -262,6 +269,15 @@ func commandRun(args []string) error {
 	if ctx.Err() != nil {
 		_ = state.record("run_stopped", map[string]any{"reason": ctx.Err().Error()})
 	}
+	if o.mode == "workflows" {
+		summary := state.snapshot()
+		fmt.Printf("Workflow runs (%s): %d dispatched, %d passed, %d failed intentionally as requested, %d failed verification, %d unresolved\n",
+			o.workload, summary.Attempts, summary.Passed, summary.IntentionalFailures, summary.Failed, summary.Unresolved)
+		if workErr == nil && (summary.Failed > 0 || summary.Unresolved > 0) {
+			workErr = fmt.Errorf("%d workflow runs failed verification and %d were unresolved; see verification_error in %s",
+				summary.Failed, summary.Unresolved, filepath.Join(state.dir, "journal.jsonl"))
+		}
+	}
 	if workErr != nil {
 		_ = state.update(func(data *runData) {
 			data.Status = "failed"
@@ -307,8 +323,12 @@ func (o runOptions) validate() error {
 		return errors.New("--max-log-bytes must be between 0 and 1048576")
 	case o.maxOutstandingJobs <= 0 || o.maxOutstandingJobs > 2500:
 		return errors.New("--max-outstanding-jobs must be between 1 and 2500")
-	case o.mode == "workflows" && o.maxOutstandingJobs < o.jobsPerRun:
-		return errors.New("--max-outstanding-jobs must fit at least one full workflow matrix")
+	case o.workload != workloadSynthetic && o.workload != workloadCI:
+		return errors.New("--workload must be synthetic or ci")
+	case o.mode != "workflows" && o.workload != workloadSynthetic:
+		return errors.New("--workload applies only to --mode workflows")
+	case o.mode == "workflows" && o.maxOutstandingJobs < jobsPerDispatch(o.workload, o.jobsPerRun):
+		return fmt.Errorf("--max-outstanding-jobs must fit at least one full workflow dispatch (%d jobs)", jobsPerDispatch(o.workload, o.jobsPerRun))
 	case o.mode == "workflows" && len(o.runID) > 59:
 		return errors.New("workflow mode requires --run-id to be at most 59 characters so generated markers stay within the workflow limit")
 	case o.runnerMemoryMiB < 256 || o.runnerMemoryMiB > 65536:

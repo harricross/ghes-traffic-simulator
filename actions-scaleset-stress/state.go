@@ -24,35 +24,55 @@ type runnerRecord struct {
 type workflowRecord struct {
 	ID               int64     `json:"id"`
 	Marker           string    `json:"marker"`
+	Workload         string    `json:"workload,omitempty"`
+	Shards           int       `json:"shards,omitempty"`
 	Jobs             int       `json:"jobs"`
 	CreatedAt        time.Time `json:"created_at"`
 	Status           string    `json:"status"`
 	Conclusion       string    `json:"conclusion,omitempty"`
 	ExpectedFailures int       `json:"expected_failures"`
+	CompletedSeenAt  time.Time `json:"completed_seen_at,omitzero"`
+}
+
+func (r workflowRecord) workload() string {
+	if r.Workload == "" {
+		return workloadSynthetic
+	}
+	return r.Workload
+}
+
+func (r workflowRecord) shards() int {
+	if r.Shards > 0 {
+		return r.Shards
+	}
+	return r.Jobs
 }
 
 type runData struct {
-	SchemaVersion   int              `json:"schema_version"`
-	RunID           string           `json:"run_id"`
-	Mode            string           `json:"mode"`
-	CreatedAt       time.Time        `json:"created_at"`
-	UpdatedAt       time.Time        `json:"updated_at"`
-	APIHost         string           `json:"api_host"`
-	Owner           string           `json:"owner"`
-	Repo            string           `json:"repo"`
-	ScaleSetID      int              `json:"scale_set_id,omitempty"`
-	Runners         []runnerRecord   `json:"runners,omitempty"`
-	ContainerIDs    []string         `json:"container_ids,omitempty"`
-	ScaleSetRemoved bool             `json:"scale_set_removed,omitempty"`
-	Workflows       []workflowRecord `json:"workflows,omitempty"`
-	Attempts        int              `json:"attempts"`
-	Accepted        int              `json:"accepted"`
-	Completed       int              `json:"completed"`
-	Failed          int              `json:"failed"`
-	Unresolved      int              `json:"unresolved"`
-	Status          string           `json:"status"`
-	CleanupStatus   string           `json:"cleanup_status"`
-	LastError       string           `json:"last_error,omitempty"`
+	SchemaVersion       int              `json:"schema_version"`
+	RunID               string           `json:"run_id"`
+	Mode                string           `json:"mode"`
+	Workload            string           `json:"workload,omitempty"`
+	CreatedAt           time.Time        `json:"created_at"`
+	UpdatedAt           time.Time        `json:"updated_at"`
+	APIHost             string           `json:"api_host"`
+	Owner               string           `json:"owner"`
+	Repo                string           `json:"repo"`
+	ScaleSetID          int              `json:"scale_set_id,omitempty"`
+	Runners             []runnerRecord   `json:"runners,omitempty"`
+	ContainerIDs        []string         `json:"container_ids,omitempty"`
+	ScaleSetRemoved     bool             `json:"scale_set_removed,omitempty"`
+	Workflows           []workflowRecord `json:"workflows,omitempty"`
+	Attempts            int              `json:"attempts"`
+	Accepted            int              `json:"accepted"`
+	Completed           int              `json:"completed"`
+	Passed              int              `json:"passed"`
+	IntentionalFailures int              `json:"intentional_failures"`
+	Failed              int              `json:"failed"`
+	Unresolved          int              `json:"unresolved"`
+	Status              string           `json:"status"`
+	CleanupStatus       string           `json:"cleanup_status"`
+	LastError           string           `json:"last_error,omitempty"`
 }
 
 type runState struct {

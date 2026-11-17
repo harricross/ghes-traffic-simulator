@@ -39,6 +39,7 @@ type target struct {
 	scaleSet  *scaleset.Client
 	identity  string
 	repoState string
+	ready     bool
 }
 
 var (
@@ -96,6 +97,9 @@ func (c config) validate() error {
 	clean := path.Clean(c.WorkflowFile)
 	if clean != c.WorkflowFile || strings.HasPrefix(clean, "/") || !strings.HasPrefix(clean, ".github/workflows/") || !strings.HasSuffix(clean, ".yml") && !strings.HasSuffix(clean, ".yaml") {
 		return errors.New("workflow_file must be a .yml or .yaml path under .github/workflows/")
+	}
+	if clean == ciWorkflowFile {
+		return fmt.Errorf("workflow_file must not be %s, which is reserved for the CI workload", ciWorkflowFile)
 	}
 	if c.ScaleSetName == "" || !safeName.MatchString(c.ScaleSetName) || len(c.ScaleSetName) > 40 {
 		return errors.New("scale_set_name must be 1-40 safe characters")

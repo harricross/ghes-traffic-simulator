@@ -1,0 +1,5 @@
+{
+  "name": "loadlab",
+  "checks": ["lint", "test", "build"],
+  "shard_strategy": "round-robin"
+}

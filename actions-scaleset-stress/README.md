@@ -6,10 +6,12 @@ disposable runner scale sets. It has two profiles:
 
 - `registrations` repeatedly creates just-in-time runner registrations and
   removes them after a configurable dwell.
-- `workflows` dispatches a synthetic matrix workflow and runs it on
-  digest-pinned, operator-supplied Actions runner containers. The workflow
-  produces and verifies a small output, can emit bounded logs and duration,
-  and can intentionally fail a selected percentage of jobs.
+- `workflows` dispatches workflows and runs them on digest-pinned,
+  operator-supplied Actions runner containers. The `synthetic` workload is a
+  matrix that produces and verifies bounded output; the `ci` workload runs a
+  real check pipeline (lint, sharded unit tests, build) from a small project
+  that `prepare` commits. A selected percentage of runs can fail
+  intentionally; the rest are expected to pass and are verified.
 
 There is no fake GHES server or mock runner protocol. The tool does not contact
 GHES until `check`, `prepare`, `run`, or `cleanup` is explicitly invoked.
@@ -73,10 +75,18 @@ Run the wrapper from the repository root; it builds the Go program under
 ```
 
 `prepare` creates the configured private repository if absent and installs
-the generated workflow only if that path does not already contain different
-content. It verifies the repository and active workflow before succeeding.
-An existing different workflow is never overwritten. Run `check` again if
-Actions settings or the repository have changed.
+all managed files in one commit on the configured ref:
+
+- the synthetic workflow at `workflow_file`;
+- the CI workflow at `.github/workflows/ci-checks.yml`;
+- a small Python project under `ci/` (sources, settings, 38 unit tests, a
+  shard runner, and `lint.sh`/`build.sh` check scripts).
+
+A managed path that already contains different content is never
+overwritten; `prepare` refuses instead. It verifies the repository and that
+both workflows are active before succeeding. Because the workflows are
+committed under `.github/workflows`, the token also needs the `workflow`
+scope. Run `check` again if Actions settings or the repository have changed.
 
 Registration churn example:
 
@@ -100,11 +110,34 @@ Workflow example:
   --job-duration 10s --max-log-bytes 1024
 ```
 
-`--fail-percent` (0-100) selects a deterministic prefix of matrix shards to
-fail after output verification. Intentional failures are counted as valid
-synthetic outcomes; unexpected failures or missing outputs fail the run.
-Workflow mode accepts at most 100 dispatches per run and 25 matrix jobs per
-dispatch. The `--duration` deadline, operation rate, runner count, job count,
+`--workload` selects what each dispatch runs:
+
+- `synthetic` (default): `--jobs-per-run` matrix jobs that write and verify
+  bounded output.
+- `ci`: a check pipeline of `Lint`, then `--jobs-per-run` sharded
+  `Test shard N` jobs running the real unit tests, then `Build`, which
+  packages a deterministic tarball and verifies its checksum. Each dispatch
+  uses `--jobs-per-run + 2` jobs, which must fit `--max-outstanding-jobs`.
+
+```bash
+./actions-scaleset-stress.sh run \
+  --config actions-scaleset-stress.json \
+  --mode workflows --workload ci \
+  --duration 10m --total 20 --rate 1 \
+  --max-runners 6 --jobs-per-run 4 \
+  --max-outstanding-jobs 30 --fail-percent 10
+```
+
+`--fail-percent` (0-100) is the share of dispatched runs that fail
+intentionally, spread evenly (for example, 25 fails every fourth run). A
+failing run fails only shard 0, after its output or tests have been
+verified; in the CI workload `Build` is then skipped. All other runs are
+expected to pass completely. Each completed run is verified job by job
+and step by step, and counted as `passed`, `intentional_failures`, or
+`failed` (unexpected outcome) in `state.json`. The run exits non-zero if
+any workflow run failed verification or was unresolved.
+Workflow mode accepts at most 100 dispatches per run and 25 matrix jobs or
+test shards per dispatch. The `--duration` deadline, operation rate, runner count, job count,
 outstanding-job limit, container CPU/memory, work duration, log size, and
 drain timeout are independently bounded.
 
