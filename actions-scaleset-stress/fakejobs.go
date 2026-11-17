@@ -35,6 +35,7 @@ const (
 	fakeJobMessageType       = "PipelineAgentJobRequest"
 	fakeJobBrokerMessageType = "RunnerJobRequest"
 	fakeJobEventsAccept      = "application/json; api-version=2.0-preview.1"
+	fakeJobRecordsAccept     = "application/json; api-version=5.1-preview.1"
 	fakeJobEmptyLockToken    = "00000000-0000-0000-0000-000000000000"
 	fakeJobAttempts          = 3
 	fakeJobCallTimeout       = 30 * time.Second
@@ -146,6 +147,9 @@ type agentJobRequest struct {
 		PlanID          string  `json:"planId"`
 		Version         flexInt `json:"version"`
 	} `json:"plan"`
+	Timeline struct {
+		ID string `json:"id"`
+	} `json:"timeline"`
 	Resources struct {
 		Endpoints []struct {
 			Name          string `json:"name"`
@@ -174,8 +178,22 @@ func decodeJobMessage(key []byte, msg probeMessage) (*agentJobRequest, error) {
 		return nil, errors.New("job message has no jobId")
 	case job.Plan.PlanID == "" || job.Plan.ScopeIdentifier == "" || job.Plan.PlanType == "":
 		return nil, errors.New("job message has an incomplete plan reference")
+	case job.Timeline.ID == "":
+		return nil, errors.New("job message has no timeline")
 	}
 	return &job, nil
+}
+
+// planURL returns the URL of path under the job's plan on its
+// SystemVssConnection endpoint, and the job's access token.
+func (j *agentJobRequest) planURL(path string) (string, string, error) {
+	connURL, token, err := j.systemConnection()
+	if err != nil {
+		return "", "", err
+	}
+	return fmt.Sprintf("%s/%s/_apis/distributedtask/hubs/%s/plans/%s/%s",
+		strings.TrimRight(connURL, "/"), url.PathEscape(j.Plan.ScopeIdentifier),
+		url.PathEscape(j.Plan.PlanType), url.PathEscape(j.Plan.PlanID), path), token, nil
 }
 
 // systemConnection returns the URL and access token of the job's
@@ -467,17 +485,53 @@ func (r *probeRunner) holdJob(ctx context.Context, job *agentJobRequest) (cancel
 	}
 }
 
-// completeJob raises the JobCompleted plan event with the job's access
-// token and, for plans that do not finish the request themselves, finishes
-// the job request.
-func (r *probeRunner) completeJob(ctx context.Context, job *agentJobRequest, result string) error {
-	connURL, token, err := job.systemConnection()
+// updateJobRecord updates the job's timeline record as the runner does.
+// GHES takes the job's status, timing and conclusion from this record; a
+// job completed without it is reported as skipped.
+func (r *probeRunner) updateJobRecord(ctx context.Context, job *agentJobRequest, state, result string, at time.Time) error {
+	target, token, err := job.planURL("timelines/" + url.PathEscape(job.Timeline.ID) + "/records")
 	if err != nil {
 		return err
 	}
-	target := fmt.Sprintf("%s/%s/_apis/distributedtask/hubs/%s/plans/%s/events",
-		strings.TrimRight(connURL, "/"), url.PathEscape(job.Plan.ScopeIdentifier),
-		url.PathEscape(job.Plan.PlanType), url.PathEscape(job.Plan.PlanID))
+	record := map[string]any{
+		"id": job.JobID, "recordType": "Job", "state": state,
+		"workerName": r.name, "agentPlatform": probeOS,
+	}
+	if job.JobDisplayName != "" {
+		record["name"] = job.JobDisplayName
+	}
+	if job.JobName != "" {
+		record["refName"] = job.JobName
+	}
+	stamp := at.UTC().Format(time.RFC3339Nano)
+	if result == "" {
+		record["startTime"] = stamp
+	} else {
+		record["result"] = result
+		record["finishTime"] = stamp
+	}
+	body := map[string]any{"count": 1, "value": []any{record}}
+	status, data, err := r.jobCall(ctx, "update job timeline record", http.MethodPatch, target, fakeJobRecordsAccept, token, body)
+	switch {
+	case err != nil:
+		return err
+	case status != http.StatusOK:
+		return httpStatusError("update job timeline record", status, data)
+	}
+	return nil
+}
+
+// completeJob records the job's result on its timeline, raises the
+// JobCompleted plan event with the job's access token and, for plans that
+// do not finish the request themselves, finishes the job request.
+func (r *probeRunner) completeJob(ctx context.Context, job *agentJobRequest, result string) error {
+	if err := r.updateJobRecord(ctx, job, "completed", result, time.Now()); err != nil {
+		return err
+	}
+	target, token, err := job.planURL("events")
+	if err != nil {
+		return err
+	}
 	event := map[string]any{"name": "JobCompleted", "jobId": job.JobID, "requestId": int64(job.RequestID), "result": result}
 	status, data, err := r.jobCall(ctx, "raise JobCompleted", http.MethodPost, target, fakeJobEventsAccept, token, event)
 	if err == nil && status == http.StatusBadRequest {
@@ -513,7 +567,19 @@ func (r *probeRunner) completeJob(ctx context.Context, job *agentJobRequest, res
 }
 
 // runFakeJob accepts, holds and completes one job and returns its result.
+// It closes the runner's session before completing the job, while the
+// runner still exists: GHES deletes an ephemeral runner once its job
+// completes, after which the session can no longer be deleted.
 func (r *probeRunner) runFakeJob(ctx context.Context, msg probeMessage) (string, error) {
+	sessionEnded := false
+	endSession := func() {
+		if !sessionEnded {
+			sessionEnded = true
+			r.endJobSession(ctx)
+		}
+	}
+	defer endSession()
+
 	job, decodeErr := decodeJobMessage(r.sessionKey, msg)
 	if decodeErr == nil {
 		_, _, decodeErr = job.systemConnection()
@@ -528,6 +594,10 @@ func (r *probeRunner) runFakeJob(ctx context.Context, msg probeMessage) (string,
 	if fakeJobFails(job.ContextData) {
 		result = fakeJobFailed
 	}
+	// A cancelled ctx makes holdJob report the job as canceled.
+	if err := r.updateJobRecord(ctx, job, "inProgress", "", time.Now()); err != nil && ctx.Err() == nil {
+		return "", err
+	}
 	canceled, err := r.holdJob(ctx, job)
 	if err != nil {
 		return "", err
@@ -539,6 +609,7 @@ func (r *probeRunner) runFakeJob(ctx context.Context, msg probeMessage) (string,
 		completeCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), fakeJobCancelGrace)
 		defer cancel()
 	}
+	endSession()
 	if err := r.completeJob(completeCtx, job, result); err != nil {
 		if canceled {
 			// Completing a cancelled job is best-effort; GHES may already
@@ -550,9 +621,9 @@ func (r *probeRunner) runFakeJob(ctx context.Context, msg probeMessage) (string,
 	return result, nil
 }
 
-// handleJob runs one job, closes the session and, unless the job failed or
-// the run is ending, registers a replacement runner. The ephemeral runner
-// is then deleted by GHES, so poll must return afterwards.
+// handleJob runs one job, which ends the session and, unless the job failed
+// or the run is ending, registers a replacement runner. The ephemeral
+// runner is then deleted by GHES, so poll must return afterwards.
 func (r *probeRunner) handleJob(ctx context.Context, msg probeMessage) {
 	c := r.counters
 	c.jobsReceived.Add(1)
@@ -569,18 +640,6 @@ func (r *probeRunner) handleJob(ctx context.Context, msg probeMessage) {
 	default:
 		c.jobsCanceled.Add(1)
 	}
-
-	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fakeJobCallTimeout)
-	closeErr := r.closeSession(closeCtx)
-	cancel()
-	if closeErr != nil {
-		// closeAll retries the session, which keeps its sessionID.
-		c.closeErrors.Add(1)
-		c.setError(safeError(closeErr))
-	} else {
-		c.open.Add(-1)
-		c.closed.Add(1)
-	}
 	r.setStage("job_done")
 	if err != nil || ctx.Err() != nil || r.jobs.replace == nil {
 		return
@@ -594,6 +653,21 @@ func (r *probeRunner) handleJob(ctx context.Context, msg probeMessage) {
 		return
 	}
 	c.replacements.Add(1)
+}
+
+// endJobSession closes the session of a runner that took a job.
+func (r *probeRunner) endJobSession(ctx context.Context) {
+	c := r.counters
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fakeJobCallTimeout)
+	defer cancel()
+	if err := r.closeSession(closeCtx); err != nil {
+		// closeAll retries the session, which keeps its sessionID.
+		c.closeErrors.Add(1)
+		c.setError(safeError(err))
+		return
+	}
+	c.open.Add(-1)
+	c.closed.Add(1)
 }
 
 func (r *probeRunner) jobFatal(err error) {

@@ -133,20 +133,41 @@ type fakeJobEndpoints struct {
 	events      []map[string]any
 	eventAuth   []string
 	finishes    []map[string]any
+	records     []map[string]any // each updated timeline record
+	recordAuth  []string
+	// sessionOpenAtEvent records, per events call, whether the runner's
+	// session was still open.
+	sessionOpenAtEvent []bool
 }
 
 func (e *fakeJobEndpoints) handle(w http.ResponseWriter, r *http.Request) bool {
-	const events = "/vss/scope-1/_apis/distributedtask/hubs/build/plans/plan-1/events"
+	const plan = "/vss/scope-1/_apis/distributedtask/hubs/build/plans/plan-1/"
+	const events, records = plan + "events", plan + "timelines/timeline-1/records"
 	path := r.URL.Path
-	if path != events && path != testPoolPath+"messages/1" && path != testPoolPath+"jobrequests/7" {
+	if path != events && path != records && path != testPoolPath+"messages/1" && path != testPoolPath+"jobrequests/7" {
 		return false
 	}
 	var body map[string]any
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
+	e.sessions.mu.Lock()
+	_, sessionOpen := e.sessions.sessions["sess-client-1"]
+	e.sessions.mu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if path == records {
+		values, _ := body["value"].([]any)
+		if r.Method != http.MethodPatch || r.Header.Get("Accept") != fakeJobRecordsAccept || body["count"] != float64(1) || len(values) != 1 {
+			w.WriteHeader(http.StatusTeapot)
+			return true
+		}
+		record, _ := values[0].(map[string]any)
+		e.records = append(e.records, record)
+		e.recordAuth = append(e.recordAuth, r.Header.Get("Authorization"))
+		_ = json.NewEncoder(w).Encode(values)
+		return true
+	}
 	if path == events {
 		if r.Method != http.MethodPost || r.Header.Get("Accept") != fakeJobEventsAccept {
 			w.WriteHeader(http.StatusTeapot)
@@ -154,6 +175,7 @@ func (e *fakeJobEndpoints) handle(w http.ResponseWriter, r *http.Request) bool {
 		}
 		e.events = append(e.events, body)
 		e.eventAuth = append(e.eventAuth, r.Header.Get("Authorization"))
+		e.sessionOpenAtEvent = append(e.sessionOpenAtEvent, sessionOpen)
 		status := http.StatusOK
 		if len(e.eventStatus) > 0 {
 			status, e.eventStatus = e.eventStatus[0], e.eventStatus[1:]
@@ -184,7 +206,8 @@ func testJobMessage(t *testing.T, serverURL string, aesKey []byte, planVersion i
 	t.Helper()
 	job, err := json.Marshal(map[string]any{
 		"requestId": 7, "jobId": "job-1", "jobDisplayName": "Test shard 1",
-		"plan": map[string]any{"scopeIdentifier": "scope-1", "planType": "build", "planId": "plan-1", "version": planVersion},
+		"plan":     map[string]any{"scopeIdentifier": "scope-1", "planType": "build", "planId": "plan-1", "version": planVersion},
+		"timeline": map[string]any{"id": "timeline-1"},
 		"resources": map[string]any{"endpoints": []any{map[string]any{
 			"name": "SystemVssConnection", "url": serverURL + "/vss/",
 			"authorization": map[string]any{"scheme": "OAuth", "parameters": map[string]string{"AccessToken": "job-token"}},
@@ -311,10 +334,22 @@ func TestFakeRunnerRunsJobAndReportsResult(t *testing.T) {
 			if endpoints.deletes != 1 || endpoints.renews == 0 {
 				t.Fatalf("message deletes %d, renews %d", endpoints.deletes, endpoints.renews)
 			}
-			for _, auth := range endpoints.eventAuth {
+			for _, auth := range append(endpoints.eventAuth, endpoints.recordAuth...) {
 				if auth != "Bearer job-token" {
-					t.Fatalf("events must use the job's access token, got %q", auth)
+					t.Fatalf("events and records must use the job's access token, got %q", auth)
 				}
+			}
+			for _, open := range endpoints.sessionOpenAtEvent {
+				if open {
+					t.Fatal("the session must close before the job completes and GHES deletes the runner")
+				}
+			}
+			if r := endpoints.records; len(r) != 2 ||
+				r[0]["id"] != "job-1" || r[0]["state"] != "inProgress" || r[0]["startTime"] == nil || r[0]["result"] != nil ||
+				r[1]["id"] != "job-1" || r[1]["state"] != "completed" || r[1]["finishTime"] == nil ||
+				r[0]["workerName"] != "fake-1" || r[0]["name"] != "Test shard 1" ||
+				len(endpoints.events) == 0 || r[1]["result"] != endpoints.events[0]["result"] {
+				t.Fatalf("timeline records %v, want inProgress then completed with the event's result", r)
 			}
 			tc.check(t, s, endpoints, replaced, fatal)
 			if text := out.String(); strings.Contains(text, "job-token") || strings.Contains(text, "SECRETtoken") {
@@ -329,16 +364,17 @@ func TestFakeRunnerRunsJobAndReportsResult(t *testing.T) {
 
 func TestDecodeJobMessageRejectsIncompleteJobs(t *testing.T) {
 	for name, body := range map[string]string{
-		"no request": `{"jobId":"j","plan":{"scopeIdentifier":"s","planType":"build","planId":"p"}}`,
-		"no job":     `{"requestId":1,"plan":{"scopeIdentifier":"s","planType":"build","planId":"p"}}`,
-		"no plan":    `{"requestId":1,"jobId":"j"}`,
-		"not json":   `{`,
+		"no request":  `{"jobId":"j","plan":{"scopeIdentifier":"s","planType":"build","planId":"p"},"timeline":{"id":"t"}}`,
+		"no job":      `{"requestId":1,"plan":{"scopeIdentifier":"s","planType":"build","planId":"p"},"timeline":{"id":"t"}}`,
+		"no plan":     `{"requestId":1,"jobId":"j","timeline":{"id":"t"}}`,
+		"no timeline": `{"requestId":1,"jobId":"j","plan":{"scopeIdentifier":"s","planType":"build","planId":"p"}}`,
+		"not json":    `{`,
 	} {
 		if _, err := decodeJobMessage(nil, probeMessage{Body: body}); err == nil {
 			t.Errorf("%s: decodeJobMessage accepted %s", name, body)
 		}
 	}
-	job, err := decodeJobMessage(nil, probeMessage{Body: `{"requestId":"1","jobId":"j","plan":{"scopeIdentifier":"s","planType":"build","planId":"p"}}`})
+	job, err := decodeJobMessage(nil, probeMessage{Body: `{"requestId":"1","jobId":"j","plan":{"scopeIdentifier":"s","planType":"build","planId":"p"},"timeline":{"id":"t"}}`})
 	if err != nil {
 		t.Fatal(err)
 	}
