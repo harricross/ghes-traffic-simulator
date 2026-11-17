@@ -301,12 +301,12 @@ func commandRun(args []string) error {
 	if workErr != nil {
 		_ = state.update(func(data *runData) {
 			data.Status = "failed"
-			data.LastError = workErr.Error()
+			data.LastError = safeError(workErr)
 		})
 	} else if cleanupErr != nil {
 		_ = state.update(func(data *runData) {
 			data.Status = "cleanup-incomplete"
-			data.LastError = cleanupErr.Error()
+			data.LastError = safeError(cleanupErr)
 		})
 	} else {
 		_ = state.update(func(data *runData) { data.Status = "complete" })

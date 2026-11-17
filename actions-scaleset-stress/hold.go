@@ -219,7 +219,7 @@ func (h *holder) register(ctx context.Context, total int) (string, error) {
 		default:
 			failures.Add(1)
 			if consecutive.Add(1) >= holdMaxConsecutiveFailures {
-				stop(fmt.Sprintf("%d consecutive registration failures; last: %v", holdMaxConsecutiveFailures, err), nil)
+				stop(fmt.Sprintf("%d consecutive registration failures; last: %s", holdMaxConsecutiveFailures, safeError(err)), nil)
 			}
 		}
 	})
@@ -454,7 +454,7 @@ func (h *holder) removeAll(ctx context.Context) error {
 	forEachPaced(rctx, len(pending), h.workers, h.rate, func(i int) {
 		if err := h.removeOne(rctx, pending[i]); err != nil {
 			failed.Add(1)
-			firstErr.CompareAndSwap(nil, err.Error())
+			firstErr.CompareAndSwap(nil, safeError(err))
 		} else {
 			removed.Add(1)
 		}

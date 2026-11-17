@@ -220,7 +220,7 @@ so a single small host can hold tens of thousands:
 ./actions-scaleset-stress.sh run \
   --config actions-scaleset-stress.json \
   --mode hold \
-  --total 10000 --rate 50 --max-inflight 32 \
+  --total 10000 --rate 25 --max-inflight 16 \
   --dwell 30m --duration 2h
 ```
 
@@ -228,16 +228,24 @@ so a single small host can hold tens of thousands:
   second with `--max-inflight` concurrent API calls. After 20 consecutive
   registration failures the run stops growing, holds what it has, and records
   the stopping point in `scale.ceiling_runners`/`scale.ceiling_reason`.
+- GHES allows at most **10,000 runners per runner group** (online or not);
+  the 10,001st registration fails with `RunnerGroupTooManyRunnersException`
+  and the run stops there. Use a different `runner_group` in the configuration
+  to hold more than 10,000 at once.
+- Registration is CPU-heavy on the appliance. On the 8-CPU test appliance,
+  about 65 registrations/s raised load1 to ~25 within a minute (the guard
+  stopped the run at 8,298), while 25/s kept load1 at 3-5. Start at
+  `--rate 25` and raise it only while watching appliance load.
 - `--dwell` (up to 24h) is the hold time; `--duration` must exceed it. Every
   minute a random sample of 50 registrations is checked, and a final sample of
   500 runs before removal. Registrations GHES drops on its own are counted in
   `held_missing`, the first 50 are journaled as `runner_missing_during_hold`,
   and `first_missing_after_seconds` records how old the first one was. This
   tells you whether GHES garbage-collects runners that never connect.
-- Removal is bulk and paced, retries each runner, never removes a runner whose
-  name does not belong to the run, and spot-checks that removed runners are
-  gone. `cleanup --apply` uses the same path and verifies each journaled
-  runner ID still has its journaled name.
+- Removal is bulk and paced at the same `--rate`, retries each runner, never
+  removes a runner whose name does not belong to the run, and spot-checks that
+  removed runners are gone. `cleanup --apply` uses the same path and verifies
+  each journaled runner ID still has its journaled name.
 - To keep a 100000-runner run practical, `state.json` is written at most every
   two seconds (the journal is still synced per event). If the process is
   killed, `cleanup` rebuilds the runner list from the journal.
@@ -286,6 +294,12 @@ Measured on GHES 3.20.10 (8 CPU, 61 GB) from a 4-core/16 GB Codespace:
 | 100 | 100 | 0 | <1 GiB | ~3 |
 | 1000 | 1000 | 0 | ~1.8 GiB | ~4–5 |
 | 3000 | 3000 | 0 | ~1.7 GiB | ~4–7.5 while opening |
+| 6000 | 6000 | 0 | ~1.9 GiB | peak ~12.7 while opening, ~4 held |
+| 10000 (group limit) | 10000 | 0 | ~2.1 GiB | peak ~8 while opening, ~3–5 held |
+
+Open sessions gradually (`--open-concurrency 6-10`); the opening burst, not the
+steady state, is what loads the appliance. The 10,000 runner-group limit
+applies here too.
 
 For comparison, a real runner container used about 768 MiB each. The Actions
 data lives in MSSQL (`/data/user/mssql`), not MySQL; the MySQL size did not

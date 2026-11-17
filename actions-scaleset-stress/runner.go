@@ -423,7 +423,7 @@ func (p *runnerPool) finishStart(ctx context.Context, err error) {
 	live := len(p.entries) + p.starting
 	p.mu.Unlock()
 	_ = p.state.update(func(data *runData) { data.Scale.ProvisionErrors++ })
-	_ = p.state.record("runner_provision_failed", map[string]any{"error": err.Error(), "consecutive": consecutive, "live": live})
+	_ = p.state.record("runner_provision_failed", map[string]any{"error": safeError(err), "consecutive": consecutive, "live": live})
 	if consecutive < maxConsecutiveStartFailures {
 		return
 	}
@@ -434,7 +434,7 @@ func (p *runnerPool) finishStart(ctx context.Context, err error) {
 	p.mu.Lock()
 	p.failures = 0
 	p.mu.Unlock()
-	p.lowerCeiling("provisioning failed: " + err.Error())
+	p.lowerCeiling("provisioning failed: " + safeError(err))
 }
 
 func (p *runnerPool) startRunner(ctx context.Context) error {
@@ -542,7 +542,7 @@ func (p *runnerPool) completeRunner(ctx context.Context, name string) error {
 	// Teardown failures are journaled, not returned: a Scale error would stop
 	// the listener, and cleanup retries any container or runner left behind.
 	if err := p.teardownRunner(ctx, entry); err != nil {
-		return p.state.record("runner_teardown_failed", map[string]any{"runner_name": name, "error": err.Error()})
+		return p.state.record("runner_teardown_failed", map[string]any{"runner_name": name, "error": safeError(err)})
 	}
 	return nil
 }

@@ -326,7 +326,7 @@ type probeRunner struct {
 }
 
 func (r *probeRunner) setStage(stage string) { r.stage.Store(stage) }
-func (r *probeRunner) fail(err error)        { r.lastErr.Store(err.Error()); r.setStage("error") }
+func (r *probeRunner) fail(err error)        { r.lastErr.Store(safeError(err)); r.setStage("error") }
 
 func (r *probeRunner) v2() bool {
 	return bool(r.jit.settings.UseV2Flow) && r.jit.settings.ServerURLV2 != ""
@@ -420,7 +420,7 @@ func (r *probeRunner) poll(ctx context.Context) {
 		r.polls.Add(1)
 		switch {
 		case err != nil:
-			r.lastErr.Store(err.Error())
+			r.lastErr.Store(safeError(err))
 			sleepCtx(ctx, 5*time.Second)
 		case status == http.StatusOK && len(bytes.TrimSpace(data)) > 0:
 			r.messages.Add(1)
@@ -436,7 +436,7 @@ func (r *probeRunner) poll(ctx context.Context) {
 			if token, err := r.http.oauthToken(ctx, r.jit, r.v2()); err == nil {
 				r.token = token
 			} else {
-				r.lastErr.Store(err.Error())
+				r.lastErr.Store(safeError(err))
 				sleepCtx(ctx, 5*time.Second)
 			}
 		default:

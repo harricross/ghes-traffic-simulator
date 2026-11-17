@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -220,9 +221,17 @@ func removeRunContainers(ctx context.Context, t *target, state *runState) error 
 	return errors.Join(failures...)
 }
 
+// pipelinesTokenPath matches the per-tenant token that GHES embeds in the
+// pipelines service URL path; SDK errors quote the full request URL.
+var pipelinesTokenPath = regexp.MustCompile(`(/_services/pipelines/)[^/\s"]+`)
+
+func redactErrorText(text string) string {
+	return pipelinesTokenPath.ReplaceAllString(text, "${1}<redacted>")
+}
+
 func safeError(err error) string {
 	if err == nil {
 		return ""
 	}
-	return err.Error()
+	return redactErrorText(err.Error())
 }

@@ -232,6 +232,14 @@ func TestHoldStopsGrowingAfterRepeatedFailures(t *testing.T) {
 	}
 }
 
+func TestSafeErrorRedactsPipelinesToken(t *testing.T) {
+	err := errors.New(`request POST https://ghes.example/_services/pipelines/SECRETtoken123/_apis/runtime/x failed(status="400")`)
+	got := safeError(err)
+	if strings.Contains(got, "SECRETtoken123") || !strings.Contains(got, "/_services/pipelines/<redacted>/_apis/runtime/x") {
+		t.Fatalf("safeError=%q", got)
+	}
+}
+
 func TestHoldTracksRunnerCreatedByFailedRegistration(t *testing.T) {
 	api := newFakeRunnerAPI()
 	api.failJIT = func(call int) error {

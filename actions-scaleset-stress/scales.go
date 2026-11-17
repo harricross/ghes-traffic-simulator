@@ -125,7 +125,7 @@ func (t *target) registerOne(ctx context.Context, state *runState, index int, dw
 			observed, lookupErr := t.scaleSet.GetRunnerByName(ctx, name)
 			switch {
 			case lookupErr != nil:
-				_ = state.record("runner_hold_check_failed", map[string]any{"runner_name": name, "error": lookupErr.Error()})
+				_ = state.record("runner_hold_check_failed", map[string]any{"runner_name": name, "error": safeError(lookupErr)})
 			case observed != nil:
 				if err := state.update(func(data *runData) { data.Scale.HeldVerified++ }); err != nil {
 					return errors.Join(err, removeRunner(context.Background(), t, state, runner.ID, name))
@@ -239,9 +239,4 @@ func shortHash(value string) string {
 	return hex.EncodeToString(sum[:4])
 }
 
-func errString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
+func errString(err error) string { return safeError(err) }
