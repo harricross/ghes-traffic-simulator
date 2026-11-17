@@ -147,6 +147,17 @@ remaining enabled operations:
   -x git_clone,git_fetch,git_push,git_branch
 ```
 
+## Stress GitHub Actions on GHES
+
+[`actions-scaleset-stress`](actions-scaleset-stress/README.md) provides bounded
+runner-registration churn and workflow execution (a synthetic matrix or a
+lint/test/build CI pipeline) against a real
+GHES appliance. It uses GitHub's official scale-set SDK and, for workflow
+load, trusted digest-pinned runner containers; it does not emulate GHES.
+Configure a disposable private repository, run `check` and `prepare`, then
+choose an explicitly approved duration and workload budget before starting
+`run`. The tool does not contact GHES unless a command is explicitly invoked.
+
 ## Add persistent tags or generate tag churn
 
 Two operations drive `/repositories/:repository_id/git/refs/*` traffic:
