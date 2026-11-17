@@ -264,24 +264,26 @@ func holdFleet(ctx context.Context, holder *holder, dwell time.Duration, work fu
 }
 
 // teardownFleetRun stops workflows, sessions, fake registrations and real
-// pools in that order. It ignores ctx cancellation (the run deadline) and
-// bounds itself with the fleet cleanup timeout instead.
+// pools in that order. It ignores ctx cancellation (the run deadline). Each
+// phase has its own deadline, so a long fake removal at --rate cannot
+// exhaust the time left to stop the real pools.
 func teardownFleetRun(ctx context.Context, t *target, state *runState, sessions *sessionManager, holder *holder,
 	pools fleetPools, options runOptions, failed bool, budget fleetBudget, out io.Writer) error {
-	base, cancel := context.WithTimeout(context.WithoutCancel(ctx), fleetCleanupTimeout(budget.Real+budget.Fake))
-	defer cancel()
+	detached := context.WithoutCancel(ctx)
 	var errs []error
 	if failed && !allWorkflowsTerminal(state.snapshot().Workflows) {
-		drainCtx, drainCancel := context.WithTimeout(base, options.drainTimeout)
+		drainCtx, drainCancel := context.WithTimeout(detached, options.drainTimeout)
 		errs = append(errs, cancelActiveWorkflows(drainCtx, t, state, options.drainTimeout))
 		drainCancel()
 	}
-	closeCtx, closeCancel := context.WithTimeout(base, 5*time.Minute+secondsAt(budget.Online, float64(max(options.openConcurrency, 1))*5))
+	closeCtx, closeCancel := context.WithTimeout(detached, 5*time.Minute+secondsAt(budget.Online, float64(max(options.openConcurrency, 1))*5))
 	errs = append(errs, sessions.closeAll(closeCtx))
 	closeCancel()
 	fmt.Fprintf(out, "Removing %d fake runners at %.0f/s\n", holder.count(), holder.rate)
-	errs = append(errs, holder.removeAll(base))
-	errs = append(errs, stopFleetPools(base, pools))
+	errs = append(errs, holder.removeAll(detached)) // bounded by its own rate-based deadline
+	poolCtx, poolCancel := context.WithTimeout(detached, fleetCleanupTimeout(budget.Real))
+	errs = append(errs, stopFleetPools(poolCtx, pools))
+	poolCancel()
 	return errors.Join(errs...)
 }
 
