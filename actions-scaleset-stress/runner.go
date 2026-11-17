@@ -455,11 +455,11 @@ func (p *runnerPool) startRunner(ctx context.Context) error {
 		if lookupErr == nil && observed != nil {
 			if stateErr := p.state.update(func(data *runData) {
 				data.Runners = append(data.Runners, runnerRecord{ID: observed.ID, Name: name, CreatedAt: time.Now().UTC()})
-				data.Unresolved++
 			}); stateErr != nil {
 				return errors.Join(fmt.Errorf("generate runner config: %w", err), stateErr)
 			}
 			if cleanupErr := removeRunner(context.Background(), p.target, p.state, observed.ID, name); cleanupErr != nil {
+				_ = p.state.update(func(data *runData) { data.Unresolved++ })
 				return errors.Join(fmt.Errorf("generate runner config: %w", err), cleanupErr)
 			}
 			return fmt.Errorf("generate runner config: %w", err)

@@ -78,11 +78,14 @@ func (t *target) registerOne(ctx context.Context, state *runState, index int, dw
 		if lookupErr == nil && observed != nil {
 			if stateErr := state.update(func(data *runData) {
 				data.Runners = append(data.Runners, runnerRecord{ID: observed.ID, Name: name, CreatedAt: time.Now().UTC()})
-				data.Unresolved++
 			}); stateErr != nil {
 				return errors.Join(fmt.Errorf("generate runner config: %w", err), stateErr)
 			}
-			return errors.Join(fmt.Errorf("generate runner config: %w", err), removeRunner(context.Background(), t, state, observed.ID, name))
+			if removeErr := removeRunner(context.Background(), t, state, observed.ID, name); removeErr != nil {
+				_ = state.update(func(data *runData) { data.Unresolved++ })
+				return errors.Join(fmt.Errorf("generate runner config: %w", err), removeErr)
+			}
+			return fmt.Errorf("generate runner config: %w", err)
 		} else {
 			stateErr := state.update(func(data *runData) {
 				data.Runners = append(data.Runners, runnerRecord{Name: name, CreatedAt: time.Now().UTC()})
