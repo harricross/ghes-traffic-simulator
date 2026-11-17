@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	probeMaxRunners = 1000
+	probeMaxRunners = 10000
 	probeMaxHold    = 30 * time.Minute
 	probeOS         = "Linux"
 	probeArch       = "X64"
