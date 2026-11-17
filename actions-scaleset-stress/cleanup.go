@@ -14,6 +14,9 @@ import (
 )
 
 func cleanupRun(ctx context.Context, t *target, state *runState) error {
+	if snapshot := state.snapshot(); len(snapshot.ScaleSets) > 0 || len(snapshot.RunnerGroups) > 0 {
+		return cleanupFleetRun(ctx, t, state)
+	}
 	var failures []error
 	if state.snapshot().Mode == "workflows" {
 		drainCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -96,6 +99,29 @@ func cleanupRun(ctx context.Context, t *target, state *runState) error {
 		} else if err := state.record("scale_set_removed", map[string]any{"scale_set_id": snapshot.ScaleSetID}); err != nil {
 			failures = append(failures, err)
 		}
+	}
+	return errors.Join(failures...)
+}
+
+// cleanupFleetRun tears down a schema-v2 run: workflows and containers first,
+// then every run-owned runner in bulk, then scale sets and run-created groups.
+func cleanupFleetRun(ctx context.Context, t *target, state *runState) error {
+	var failures []error
+	if !allWorkflowsTerminal(state.snapshot().Workflows) {
+		drainCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := cancelActiveWorkflows(drainCtx, t, state, 10*time.Second); err != nil {
+			failures = append(failures, err)
+		}
+		cancel()
+	}
+	if err := removeRunContainers(ctx, t, state); err != nil {
+		failures = append(failures, err)
+	}
+	if err := cleanupHeldRunners(ctx, t, state); err != nil {
+		failures = append(failures, err)
+	}
+	if err := teardownFleet(ctx, t.scaleSet, t.api, t.cfg.Owner, state); err != nil {
+		failures = append(failures, err)
 	}
 	return errors.Join(failures...)
 }

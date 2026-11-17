@@ -120,7 +120,7 @@ func (c config) validate() error {
 	}
 	configURL, err := url.Parse(c.ConfigURL)
 	if err != nil || configURL.Host == "" || configURL.User != nil || configURL.RawQuery != "" || configURL.Fragment != "" {
-		return errors.New("config_url must be the repository HTTPS URL without credentials or query")
+		return errors.New("config_url must be the repository or organization HTTPS URL without credentials or query")
 	}
 	webHost := strings.ToLower(configURL.Hostname())
 	if isHostedGitHub(webHost) || !strings.EqualFold(configURL.Host, apiURL.Host) ||
@@ -130,14 +130,34 @@ func (c config) validate() error {
 	if configURL.Scheme != "https" && !(configURL.Scheme == "http" && isLoopback(configURL.Hostname())) {
 		return errors.New("config_url must use HTTPS except for a loopback test endpoint")
 	}
-	wantPath := "/" + url.PathEscape(c.Owner) + "/" + url.PathEscape(c.Repo)
-	if strings.TrimRight(configURL.Path, "/") != wantPath {
-		return errors.New("config_url path must exactly match owner/repo (repository scope only)")
+	if c.scope() == "" {
+		return errors.New("config_url path must exactly match owner/repo (repository scope) or owner (organization scope)")
 	}
 	if c.RunnerImage != "" && !imageDigest.MatchString(c.RunnerImage) {
 		return errors.New("runner_image must be pinned by sha256 digest")
 	}
 	return nil
+}
+
+const (
+	scopeRepo = "repo"
+	scopeOrg  = "org"
+)
+
+// scope reports whether config_url registers runners for the repository or
+// for its owning organization; empty means config_url matches neither.
+func (c config) scope() string {
+	configURL, err := url.Parse(c.ConfigURL)
+	if err != nil {
+		return ""
+	}
+	switch strings.TrimRight(configURL.Path, "/") {
+	case "/" + url.PathEscape(c.Owner) + "/" + url.PathEscape(c.Repo):
+		return scopeRepo
+	case "/" + url.PathEscape(c.Owner):
+		return scopeOrg
+	}
+	return ""
 }
 
 func newTarget(cfg config, token, caCert string, insecure bool) (*target, error) {

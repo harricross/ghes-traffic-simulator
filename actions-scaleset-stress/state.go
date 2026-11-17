@@ -14,11 +14,40 @@ import (
 	"time"
 )
 
+// stateSchemaVersion 2 adds runner groups, multiple scale sets and the
+// owning scale set of each runner. Version 1 state is still read for cleanup.
+const stateSchemaVersion = 2
+
 type runnerRecord struct {
-	ID        int       `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	Removed   bool      `json:"removed"`
+	ID         int       `json:"id"`
+	Name       string    `json:"name"`
+	ScaleSetID int       `json:"scale_set_id,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	Removed    bool      `json:"removed"`
+}
+
+// runnerGroupRecord is an organization runner group a run used. Cleanup
+// deletes it only when CreatedByRun is set and the group is empty.
+type runnerGroupRecord struct {
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	CreatedByRun bool   `json:"created_by_run"`
+	Removed      bool   `json:"removed,omitempty"`
+}
+
+const (
+	scaleSetReal = "real"
+	scaleSetFake = "fake"
+)
+
+// scaleSetRecord is a run-owned scale set; Kind is scaleSetReal or scaleSetFake.
+type scaleSetRecord struct {
+	ID      int    `json:"id"`
+	Name    string `json:"name"`
+	Group   string `json:"group"`
+	GroupID int64  `json:"group_id"`
+	Kind    string `json:"kind"`
+	Removed bool   `json:"removed,omitempty"`
 }
 
 type workflowRecord struct {
@@ -49,31 +78,33 @@ func (r workflowRecord) shards() int {
 }
 
 type runData struct {
-	SchemaVersion       int              `json:"schema_version"`
-	RunID               string           `json:"run_id"`
-	Mode                string           `json:"mode"`
-	Workload            string           `json:"workload,omitempty"`
-	CreatedAt           time.Time        `json:"created_at"`
-	UpdatedAt           time.Time        `json:"updated_at"`
-	APIHost             string           `json:"api_host"`
-	Owner               string           `json:"owner"`
-	Repo                string           `json:"repo"`
-	ScaleSetID          int              `json:"scale_set_id,omitempty"`
-	Runners             []runnerRecord   `json:"runners,omitempty"`
-	ContainerIDs        []string         `json:"container_ids,omitempty"`
-	ScaleSetRemoved     bool             `json:"scale_set_removed,omitempty"`
-	Workflows           []workflowRecord `json:"workflows,omitempty"`
-	Attempts            int              `json:"attempts"`
-	Accepted            int              `json:"accepted"`
-	Completed           int              `json:"completed"`
-	Passed              int              `json:"passed"`
-	IntentionalFailures int              `json:"intentional_failures"`
-	Failed              int              `json:"failed"`
-	Unresolved          int              `json:"unresolved"`
-	Scale               scaleResults     `json:"scale,omitzero"`
-	Status              string           `json:"status"`
-	CleanupStatus       string           `json:"cleanup_status"`
-	LastError           string           `json:"last_error,omitempty"`
+	SchemaVersion       int                 `json:"schema_version"`
+	RunID               string              `json:"run_id"`
+	Mode                string              `json:"mode"`
+	Workload            string              `json:"workload,omitempty"`
+	CreatedAt           time.Time           `json:"created_at"`
+	UpdatedAt           time.Time           `json:"updated_at"`
+	APIHost             string              `json:"api_host"`
+	Owner               string              `json:"owner"`
+	Repo                string              `json:"repo"`
+	ScaleSetID          int                 `json:"scale_set_id,omitempty"`
+	Runners             []runnerRecord      `json:"runners,omitempty"`
+	ContainerIDs        []string            `json:"container_ids,omitempty"`
+	ScaleSetRemoved     bool                `json:"scale_set_removed,omitempty"`
+	RunnerGroups        []runnerGroupRecord `json:"runner_groups,omitempty"`
+	ScaleSets           []scaleSetRecord    `json:"scale_sets,omitempty"`
+	Workflows           []workflowRecord    `json:"workflows,omitempty"`
+	Attempts            int                 `json:"attempts"`
+	Accepted            int                 `json:"accepted"`
+	Completed           int                 `json:"completed"`
+	Passed              int                 `json:"passed"`
+	IntentionalFailures int                 `json:"intentional_failures"`
+	Failed              int                 `json:"failed"`
+	Unresolved          int                 `json:"unresolved"`
+	Scale               scaleResults        `json:"scale,omitzero"`
+	Status              string              `json:"status"`
+	CleanupStatus       string              `json:"cleanup_status"`
+	LastError           string              `json:"last_error,omitempty"`
 }
 
 // scaleResults records the highest runner counts a run reached and why
@@ -178,7 +209,7 @@ func createRunState(root, id, mode string, t *target) (*runState, error) {
 		dir: dir,
 		log: journal,
 		data: runData{
-			SchemaVersion: 1,
+			SchemaVersion: stateSchemaVersion,
 			RunID:         id,
 			Mode:          mode,
 			CreatedAt:     time.Now().UTC(),
@@ -207,7 +238,7 @@ func openRunState(root, id string, t *target) (*runState, error) {
 	if err := json.Unmarshal(stateBytes, &data); err != nil {
 		return nil, fmt.Errorf("decode run state: %w", err)
 	}
-	if data.SchemaVersion != 1 || data.RunID != id {
+	if data.SchemaVersion < 1 || data.SchemaVersion > stateSchemaVersion || data.RunID != id {
 		return nil, errors.New("run state version or identifier does not match")
 	}
 	if data.APIHost != t.api.base || data.Owner != t.cfg.Owner || data.Repo != t.cfg.Repo {
@@ -301,6 +332,8 @@ func (s *runState) snapshot() runData {
 	result := s.data
 	result.Runners = append([]runnerRecord(nil), s.data.Runners...)
 	result.ContainerIDs = append([]string(nil), s.data.ContainerIDs...)
+	result.RunnerGroups = append([]runnerGroupRecord(nil), s.data.RunnerGroups...)
+	result.ScaleSets = append([]scaleSetRecord(nil), s.data.ScaleSets...)
 	result.Workflows = append([]workflowRecord(nil), s.data.Workflows...)
 	return result
 }
@@ -351,7 +384,30 @@ func (s *runState) heartbeat(ctx context.Context, done chan<- error) {
 func (s *runState) preview(w io.Writer) error {
 	data := s.snapshot()
 	fmt.Fprintf(w, "Run %s (%s) for %s/%s on %s\n", data.RunID, data.Mode, data.Owner, data.Repo, data.APIHost)
-	fmt.Fprintf(w, "  runner scale set ID: %d\n  runner IDs: %v\n  container IDs: %v\n  workflow run IDs:", data.ScaleSetID, runnerIDs(data.Runners), data.ContainerIDs)
+	if data.ScaleSetID > 0 || len(data.ScaleSets) == 0 {
+		fmt.Fprintf(w, "  runner scale set ID: %d\n", data.ScaleSetID)
+	}
+	for _, set := range data.ScaleSets {
+		if !set.Removed {
+			fmt.Fprintf(w, "  runner scale set ID: %d (%s, %s, group %s)\n", set.ID, set.Name, set.Kind, set.Group)
+		}
+	}
+	for _, group := range data.RunnerGroups {
+		if !group.Removed {
+			action := "kept: not created by this run"
+			if group.CreatedByRun {
+				action = "deleted when empty"
+			}
+			fmt.Fprintf(w, "  runner group ID: %d (%s, %s)\n", group.ID, group.Name, action)
+		}
+	}
+	ids := runnerIDs(data.Runners)
+	if len(ids) > 50 {
+		fmt.Fprintf(w, "  runner IDs: %d runners, first %v\n", len(ids), ids[:50])
+	} else {
+		fmt.Fprintf(w, "  runner IDs: %v\n", ids)
+	}
+	fmt.Fprintf(w, "  container IDs: %v\n  workflow run IDs:", data.ContainerIDs)
 	for _, workflow := range data.Workflows {
 		fmt.Fprintf(w, " %d", workflow.ID)
 	}

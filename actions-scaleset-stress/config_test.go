@@ -54,3 +54,32 @@ func TestConfigRequiresGHESHostAndRepositoryScopedURL(t *testing.T) {
 		t.Fatal("expected hosted GitHub to be rejected")
 	}
 }
+
+func TestConfigScopeAcceptsRepositoryOrOwningOrganization(t *testing.T) {
+	cfg := config{
+		APIBaseURL:   "https://ghes.example.test/api/v3",
+		Owner:        "load-lab",
+		Repo:         "actions-stress",
+		WorkflowFile: ".github/workflows/synthetic-load.yml",
+		Ref:          "main",
+		ScaleSetName: "actions-load-test",
+		RunnerGroup:  "default",
+	}
+	for _, tc := range []struct {
+		url, scope string
+	}{
+		{"https://ghes.example.test/load-lab/actions-stress", scopeRepo},
+		{"https://ghes.example.test/load-lab/", scopeOrg},
+		{"https://ghes.example.test/other-org", ""},
+		{"https://ghes.example.test/load-lab/other-repo", ""},
+		{"https://ghes.example.test/enterprises/load-lab", ""},
+	} {
+		cfg.ConfigURL = tc.url
+		if got := cfg.scope(); got != tc.scope {
+			t.Errorf("scope(%s) = %q, want %q", tc.url, got, tc.scope)
+		}
+		if err := cfg.validate(); (err == nil) != (tc.scope != "") {
+			t.Errorf("validate(%s) = %v", tc.url, err)
+		}
+	}
+}
