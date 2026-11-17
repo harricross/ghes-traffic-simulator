@@ -249,49 +249,61 @@ func markScaleSetRemoved(state *runState, set scaleSetRecord, liveID int) error 
 
 func deleteFleetGroup(ctx context.Context, sets scaleSetAPI, groups groupAPI, org string, state *runState, group runnerGroupRecord, journaled []scaleSetRecord) error {
 	for _, set := range journaled {
-		if set.GroupID == group.ID && !set.Removed {
+		if group.ID > 0 && set.GroupID == group.ID && !set.Removed {
 			return fmt.Errorf("runner group %s retained because scale set %s remains", group.Name, set.Name)
 		}
 	}
-	live, err := groups.getRunnerGroup(ctx, org, group.ID)
+	var live *apiRunnerGroup
+	var err error
+	if group.ID > 0 {
+		live, err = groups.getRunnerGroup(ctx, org, group.ID)
+	} else {
+		// Creation was journaled but its ID was not; resolve by name.
+		live, err = groups.findRunnerGroup(ctx, org, group.Name)
+	}
 	if err != nil {
 		return err
 	}
 	if live == nil {
-		return markRunnerGroupRemoved(state, group)
+		return markRunnerGroupRemoved(state, group, group.ID)
 	}
-	if live.Name != group.Name || live.Default || live.Inherited {
+	if live.Name != group.Name || (group.ID > 0 && live.ID != group.ID) || live.Default || live.Inherited {
 		return fmt.Errorf("refusing to delete runner group ID %d: it is %q (default %t, inherited %t), journal expects %q", live.ID, live.Name, live.Default, live.Inherited, group.Name)
 	}
-	remaining, err := sets.ListRunnerScaleSets(ctx, int(group.ID))
+	remaining, err := sets.ListRunnerScaleSets(ctx, int(live.ID))
 	if err != nil {
 		return fmt.Errorf("list scale sets in runner group %s: %w", group.Name, err)
 	}
 	if len(remaining) > 0 {
 		return fmt.Errorf("runner group %s retained because it still contains %d scale sets", group.Name, len(remaining))
 	}
-	count, err := groups.runnerGroupRunnerCount(ctx, org, group.ID)
+	count, err := groups.runnerGroupRunnerCount(ctx, org, live.ID)
 	if err != nil {
 		return err
 	}
 	if count > 0 {
 		return fmt.Errorf("runner group %s retained because it still contains %d runners", group.Name, count)
 	}
-	if err := groups.deleteRunnerGroup(ctx, org, group.ID); err != nil {
+	if err := groups.deleteRunnerGroup(ctx, org, live.ID); err != nil {
 		return err
 	}
-	return markRunnerGroupRemoved(state, group)
+	return markRunnerGroupRemoved(state, group, live.ID)
 }
 
-func markRunnerGroupRemoved(state *runState, group runnerGroupRecord) error {
+// markRunnerGroupRemoved marks group's record removed, filling in liveID for a
+// record journaled before its creation returned an ID.
+func markRunnerGroupRemoved(state *runState, group runnerGroupRecord, liveID int64) error {
 	if err := state.update(func(data *runData) {
 		for i := range data.RunnerGroups {
-			if data.RunnerGroups[i].ID == group.ID {
+			if data.RunnerGroups[i].ID == group.ID && data.RunnerGroups[i].Name == group.Name {
 				data.RunnerGroups[i].Removed = true
+				if data.RunnerGroups[i].ID == 0 {
+					data.RunnerGroups[i].ID = liveID
+				}
 			}
 		}
 	}); err != nil {
 		return err
 	}
-	return state.record("runner_group_removed", map[string]any{"runner_group_id": group.ID, "runner_group": group.Name})
+	return state.record("runner_group_removed", map[string]any{"runner_group_id": liveID, "runner_group": group.Name})
 }

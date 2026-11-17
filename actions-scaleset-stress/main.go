@@ -58,6 +58,7 @@ Usage:
   actions-scaleset-stress check   --config <file>
   actions-scaleset-stress prepare --config <file>
   actions-scaleset-stress run     --config <file> --mode registrations|workflows|hold [--workload synthetic|ci] [limits]
+  actions-scaleset-stress run     --config <file> --mode fleet --fleet <spec.json> [--workload synthetic|ci] [limits]
   actions-scaleset-stress cleanup --config <file> --run-id <id> [--apply]
   actions-scaleset-stress probe-online --config <file> [--runners 3] [--hold 90s]   (spike: protocol-only online sessions)
 

@@ -303,18 +303,23 @@ func TestVerifyWorkflowRunChecksGroupPlacement(t *testing.T) {
 	}
 	own := fleetRunnerName("run", "stress-g01", fleetKindReal, 1)
 	other := fleetRunnerName("run", "stress-g02", fleetKindReal, 1)
+	suffixed := fleetRunnerName("run", "x-stress-g01", fleetKindReal, 1)
+	otherRun := fleetRunnerName("other-run", "stress-g01", fleetKindReal, 1)
 	record := workflowRecord{Workload: workloadSynthetic, Shards: 1, Group: "stress-g01"}
 	for name, tc := range map[string]struct {
 		job  apiJob
 		want bool
 	}{
-		"group name matches":       {job(own, "stress-g01"), true},
-		"runner name only":         {job(own, ""), true},
-		"group name differs":       {job(own, "stress-g02"), false},
-		"runner from other group":  {job(other, ""), false},
-		"ran with no runner names": {job("", ""), false},
+		"group name matches":             {job(own, "stress-g01"), true},
+		"runner name only":               {job(own, ""), true},
+		"group name differs":             {job(own, "stress-g02"), false},
+		"runner from other group":        {job(other, ""), false},
+		"runner from suffix-named group": {job(suffixed, ""), false},
+		"runner from other run":          {job(otherRun, ""), false},
+		"fake runner of the group":       {job(fleetRunnerName("run", "stress-g01", fleetKindFake, 1), ""), false},
+		"ran with no runner names":       {job("", ""), false},
 	} {
-		ok, reason := verifyWorkflowRun(record, []apiJob{tc.job})
+		ok, reason := verifyWorkflowRun(record, "run", []apiJob{tc.job})
 		if ok != tc.want {
 			t.Errorf("%s: verified %v (%s), want %v", name, ok, reason, tc.want)
 		}
@@ -324,11 +329,11 @@ func TestVerifyWorkflowRunChecksGroupPlacement(t *testing.T) {
 	}
 	legacy := record
 	legacy.Group = ""
-	if ok, reason := verifyWorkflowRun(legacy, []apiJob{job(other, "Default")}); !ok {
+	if ok, reason := verifyWorkflowRun(legacy, "run", []apiJob{job(other, "Default")}); !ok {
 		t.Errorf("records without a group must not check placement: %s", reason)
 	}
 	skipped := testJob("Build", "skipped")
-	if ok, reason := verifyJobPlacement([]apiJob{skipped}, "stress-g01"); !ok {
+	if ok, reason := verifyJobPlacement([]apiJob{skipped}, "run", "stress-g01"); !ok {
 		t.Errorf("a skipped job has no runner and must pass placement: %s", reason)
 	}
 }

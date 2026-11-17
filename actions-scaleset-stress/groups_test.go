@@ -66,12 +66,13 @@ func (f *fakeScaleSets) DeleteRunnerScaleSet(_ context.Context, id int) error {
 }
 
 type fakeGroups struct {
-	groups  map[int64]apiRunnerGroup
-	runners map[int64]int
-	repos   map[int64][]int64
-	nextID  int64
-	created []string
-	deleted []int64
+	groups   map[int64]apiRunnerGroup
+	runners  map[int64]int
+	repos    map[int64][]int64
+	nextID   int64
+	created  []string
+	deleted  []int64
+	onCreate func(name string)
 }
 
 func (f *fakeGroups) findRunnerGroup(_ context.Context, _, name string) (*apiRunnerGroup, error) {
@@ -84,6 +85,9 @@ func (f *fakeGroups) findRunnerGroup(_ context.Context, _, name string) (*apiRun
 }
 
 func (f *fakeGroups) createRunnerGroup(_ context.Context, _, name string, repoID int64) (*apiRunnerGroup, error) {
+	if f.onCreate != nil {
+		f.onCreate(name)
+	}
 	f.nextID++
 	group := apiRunnerGroup{ID: f.nextID, Name: name, Visibility: "selected"}
 	f.groups[group.ID] = group
@@ -257,6 +261,30 @@ func TestTeardownFleetTreatsMissingObjectsAsRemoved(t *testing.T) {
 	}
 	if !state.snapshot().RunnerGroups[0].Removed || len(groups.deleted) != 0 {
 		t.Fatal("missing group was not marked removed without a delete call")
+	}
+}
+
+// A run that crashed after creating a group but before journaling its ID
+// leaves an ID-0 record; cleanup resolves it by name.
+func TestTeardownFleetResolvesGroupsJournaledWithoutID(t *testing.T) {
+	state, sets, groups := newFleetFixture(t)
+	groups.groups[13] = apiRunnerGroup{ID: 13, Name: "lab-crashed"}
+	state.data.RunnerGroups = append(state.data.RunnerGroups,
+		runnerGroupRecord{Name: "lab-crashed", CreatedByRun: true},
+		runnerGroupRecord{Name: "lab-never-created", CreatedByRun: true},
+	)
+	if err := teardownFleet(context.Background(), sets, groups, "org", state); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(groups.deleted, []int64{11, 13}) {
+		t.Fatalf("deleted groups %v, want 11 and the crashed run's 13", groups.deleted)
+	}
+	records := state.snapshot().RunnerGroups
+	if crashed := records[2]; !crashed.Removed || crashed.ID != 13 {
+		t.Fatalf("crashed group record = %+v", crashed)
+	}
+	if never := records[3]; !never.Removed || never.ID != 0 {
+		t.Fatalf("never-created group record = %+v", never)
 	}
 }
 

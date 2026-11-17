@@ -191,6 +191,12 @@ func TestFleetSetupThenTeardownRemovesOnlyRunObjects(t *testing.T) {
 	if len(groups.created) != 0 || len(sdk.sets) != 0 {
 		t.Fatal("preflight changed GHES")
 	}
+	groups.onCreate = func(name string) {
+		// The intent must be journaled before the group exists on GHES.
+		if got := state.snapshot().RunnerGroups; len(got) != 1 || got[0].Name != name || got[0].ID != 0 || !got[0].CreatedByRun {
+			t.Errorf("journaled groups before creating %s = %+v", name, got)
+		}
+	}
 	fleet, err := createFleet(ctx, groups, sdk, "org", 42, "load", plan, state)
 	if err != nil {
 		t.Fatal(err)

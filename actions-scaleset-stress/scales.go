@@ -76,6 +76,22 @@ func fleetRunnerName(runID, group, kind string, index int) string {
 	return fmt.Sprintf("load-%s-%s-%s%06d", shortHash(runID), group, kind, index)
 }
 
+// isFleetRunnerName reports whether name is exactly a fleetRunnerName for
+// runID, group and kind, so a group name that is a suffix of another cannot
+// match the other group's runners.
+func isFleetRunnerName(name, runID, group, kind string) bool {
+	index, ok := strings.CutPrefix(name, fmt.Sprintf("load-%s-%s-%s", shortHash(runID), group, kind))
+	if !ok || len(index) != 6 {
+		return false
+	}
+	for _, c := range index {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func (t *target) registerOne(ctx context.Context, state *runState, index int, dwell time.Duration, held *atomic.Int64) error {
 	name := runnerName(state.data.RunID, index)
 	if err := state.record("runner_registration_intent", map[string]any{"runner_name": name}); err != nil {

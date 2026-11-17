@@ -368,6 +368,12 @@ func createFleet(ctx context.Context, groups groupAPI, sets fleetSetupAPI, org s
 
 func ensureFleetGroup(ctx context.Context, groups groupAPI, sets fleetSetupAPI, org string, repoID int64, fg *fleetGroup, state *runState) error {
 	if !fg.Reused {
+		// Journal the intent first so cleanup can find, by name, a group
+		// created by a run that crashes before recording its ID.
+		intent := runnerGroupRecord{Name: fg.Name, CreatedByRun: true}
+		if err := state.update(func(data *runData) { data.RunnerGroups = append(data.RunnerGroups, intent) }); err != nil {
+			return err
+		}
 		created, err := groups.createRunnerGroup(ctx, org, fg.Name, repoID)
 		if err != nil {
 			// The group did not exist at preflight, so one that exists now
@@ -379,13 +385,20 @@ func ensureFleetGroup(ctx context.Context, groups groupAPI, sets fleetSetupAPI, 
 			created = found
 		}
 		fg.ID = created.ID
-	}
-	record := runnerGroupRecord{ID: fg.ID, Name: fg.Name, CreatedByRun: !fg.Reused}
-	if err := state.update(func(data *runData) { data.RunnerGroups = append(data.RunnerGroups, record) }); err != nil {
-		if !fg.Reused {
-			err = errors.Join(err, groups.deleteRunnerGroup(context.WithoutCancel(ctx), org, fg.ID))
+		if err := state.update(func(data *runData) {
+			for i := range data.RunnerGroups {
+				if data.RunnerGroups[i].ID == 0 && data.RunnerGroups[i].CreatedByRun && data.RunnerGroups[i].Name == fg.Name {
+					data.RunnerGroups[i].ID = fg.ID
+				}
+			}
+		}); err != nil {
+			return errors.Join(err, groups.deleteRunnerGroup(context.WithoutCancel(ctx), org, fg.ID))
 		}
-		return err
+	} else {
+		record := runnerGroupRecord{ID: fg.ID, Name: fg.Name}
+		if err := state.update(func(data *runData) { data.RunnerGroups = append(data.RunnerGroups, record) }); err != nil {
+			return err
+		}
 	}
 	event := "runner_group_reused"
 	if !fg.Reused {

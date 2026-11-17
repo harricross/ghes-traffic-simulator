@@ -500,7 +500,7 @@ func pollWorkflowRuns(ctx context.Context, t *target, state *runState, since tim
 				continue
 			}
 		}
-		valid, reason := verifyWorkflowRun(current, jobs)
+		valid, reason := verifyWorkflowRun(current, snapshot.RunID, jobs)
 		expectedConclusion := "success"
 		if current.ExpectedFailures > 0 {
 			expectedConclusion = "failure"
@@ -638,9 +638,9 @@ func minObservedJobs(record workflowRecord) int {
 	return jobsPerDispatch(record.workload(), record.shards())
 }
 
-func verifyWorkflowRun(record workflowRecord, jobs []apiJob) (bool, string) {
+func verifyWorkflowRun(record workflowRecord, runID string, jobs []apiJob) (bool, string) {
 	if record.Group != "" {
-		if ok, reason := verifyJobPlacement(jobs, record.Group); !ok {
+		if ok, reason := verifyJobPlacement(jobs, runID, record.Group); !ok {
 			return false, reason
 		}
 	}
@@ -651,9 +651,10 @@ func verifyWorkflowRun(record workflowRecord, jobs []apiJob) (bool, string) {
 }
 
 // verifyJobPlacement checks that every job that ran used a runner from group.
-// It prefers the reported runner group and otherwise matches the fleet runner
-// name. Jobs that never ran, such as a skipped Build, have no runner.
-func verifyJobPlacement(jobs []apiJob, group string) (bool, string) {
+// It prefers the reported runner group and otherwise requires this run's
+// exact real-runner name for group. Jobs that never ran, such as a skipped
+// Build, have no runner.
+func verifyJobPlacement(jobs []apiJob, runID, group string) (bool, string) {
 	for _, job := range jobs {
 		switch {
 		case job.RunnerGroupName != "":
@@ -661,7 +662,7 @@ func verifyJobPlacement(jobs []apiJob, group string) (bool, string) {
 				return false, fmt.Sprintf("job %q ran on runner %q in group %q, outside group %q", job.Name, job.RunnerName, job.RunnerGroupName, group)
 			}
 		case job.RunnerName != "":
-			if !strings.Contains(job.RunnerName, "-"+group+"-"+fleetKindReal) {
+			if !isFleetRunnerName(job.RunnerName, runID, group, fleetKindReal) {
 				return false, fmt.Sprintf("job %q ran on runner %q, outside group %q", job.Name, job.RunnerName, group)
 			}
 		case job.Conclusion == "success" || job.Conclusion == "failure":
