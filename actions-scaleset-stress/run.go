@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/actions/scaleset/listener"
@@ -57,6 +58,23 @@ func runWorkflowLoad(ctx context.Context, t *target, state *runState, options ru
 		listenerDone <- scaleListener.Run(listenerCtx, pool)
 		close(listenerExited)
 	}()
+	if err := state.update(func(data *runData) {
+		data.Scale.StandingTarget = options.standingRunners
+		data.Scale.RampStartedAt = time.Now().UTC()
+	}); err != nil {
+		stopListener()
+		return errors.Join(err, session.Close(context.Background()))
+	}
+	poolCtx, stopPool := context.WithCancel(context.Background())
+	poolDone := make(chan struct{})
+	go func() {
+		defer close(poolDone)
+		var group sync.WaitGroup
+		group.Add(2)
+		go func() { defer group.Done(); pool.provision(poolCtx) }()
+		go func() { defer group.Done(); pool.monitor(poolCtx) }()
+		group.Wait()
+	}()
 
 	workErr := dispatchAndObserve(ctx, t, state, options, pool, listenerExited)
 	if workErr != nil {
@@ -66,6 +84,9 @@ func runWorkflowLoad(ctx context.Context, t *target, state *runState, options ru
 		}
 		cancel()
 	}
+	pool.setStanding(0)
+	stopPool()
+	<-poolDone
 	stopListener()
 	select {
 	case listenerErr := <-listenerDone:
@@ -75,7 +96,7 @@ func runWorkflowLoad(ctx context.Context, t *target, state *runState, options ru
 	case <-time.After(10 * time.Second):
 		workErr = errors.Join(workErr, errors.New("scale-set listener did not stop within 10 seconds"))
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	if err := pool.shutdown(shutdownCtx); err != nil {
 		workErr = errors.Join(workErr, err)
 	}
@@ -87,6 +108,16 @@ func runWorkflowLoad(ctx context.Context, t *target, state *runState, options ru
 }
 
 func dispatchAndObserve(ctx context.Context, t *target, state *runState, options runOptions, pool *runnerPool, listenerExited <-chan struct{}) error {
+	if options.standingRunners > 0 {
+		fmt.Printf("Ramping up to %d standing runners (rate %.1f/s, timeout %s)\n", options.standingRunners, options.rampRate, options.rampTimeout)
+		if err := pool.waitRamped(ctx, options.rampTimeout); err != nil {
+			return fmt.Errorf("ramp standing runners: %w", err)
+		}
+		snapshot := state.snapshot()
+		fmt.Printf("Ramp finished after %s with %d runners (ceiling %d %s)\n",
+			snapshot.Scale.RampFinishedAt.Sub(snapshot.Scale.RampStartedAt).Round(time.Second), pool.count(),
+			snapshot.Scale.CeilingRunners, snapshot.Scale.CeilingReason)
+	}
 	period := time.Duration(float64(time.Second) / options.rate)
 	dispatchTicker := time.NewTicker(period)
 	defer dispatchTicker.Stop()
@@ -154,6 +185,8 @@ func dispatchAndObserve(ctx context.Context, t *target, state *runState, options
 			if ctx.Err() == nil {
 				return errors.New("scale-set listener stopped unexpectedly")
 			}
+		case err := <-pool.fatal:
+			return fmt.Errorf("runner provisioning: %w", err)
 		case <-pollTicker.C:
 			var pollErr error
 			outstandingJobs, pollErr = pollWorkflowRuns(ctx, t, state, startedAt, outstandingJobs)
@@ -165,7 +198,7 @@ func dispatchAndObserve(ctx context.Context, t *target, state *runState, options
 		}
 
 		snapshot := state.snapshot()
-		if dispatched >= options.total && allWorkflowsTerminal(snapshot.Workflows) && pool.count() == 0 {
+		if dispatched >= options.total && allWorkflowsTerminal(snapshot.Workflows) && pool.activeJobs() == 0 {
 			return nil
 		}
 	}

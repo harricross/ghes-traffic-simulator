@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -63,7 +64,7 @@ func runnerName(runID string, index int) string {
 	return fmt.Sprintf("load-%s-%06d", digest, index)
 }
 
-func (t *target) registerOne(ctx context.Context, state *runState, index int, dwell time.Duration) error {
+func (t *target) registerOne(ctx context.Context, state *runState, index int, dwell time.Duration, held *atomic.Int64) error {
 	name := runnerName(state.data.RunID, index)
 	if err := state.record("runner_registration_intent", map[string]any{"runner_name": name}); err != nil {
 		return err
@@ -105,12 +106,33 @@ func (t *target) registerOne(ctx context.Context, state *runState, index int, dw
 	if err := state.record("runner_registered", map[string]any{"runner_id": runner.ID, "runner_name": name}); err != nil {
 		return errors.Join(err, removeRunner(context.Background(), t, state, runner.ID, name))
 	}
+	holding := int(held.Add(1))
+	defer held.Add(-1)
+	if err := state.update(func(data *runData) { data.Scale.PeakHeld = max(data.Scale.PeakHeld, holding) }); err != nil {
+		return errors.Join(err, removeRunner(context.Background(), t, state, runner.ID, name))
+	}
 	if dwell > 0 {
 		timer := time.NewTimer(dwell)
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
+		}
+		if ctx.Err() == nil {
+			observed, lookupErr := t.scaleSet.GetRunnerByName(ctx, name)
+			switch {
+			case lookupErr != nil:
+				_ = state.record("runner_hold_check_failed", map[string]any{"runner_name": name, "error": lookupErr.Error()})
+			case observed != nil:
+				if err := state.update(func(data *runData) { data.Scale.HeldVerified++ }); err != nil {
+					return errors.Join(err, removeRunner(context.Background(), t, state, runner.ID, name))
+				}
+			default:
+				if err := state.update(func(data *runData) { data.Scale.HeldMissing++ }); err != nil {
+					return errors.Join(err, removeRunner(context.Background(), t, state, runner.ID, name))
+				}
+				_ = state.record("runner_missing_before_removal", map[string]any{"runner_name": name, "runner_id": runner.ID})
+			}
 		}
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -163,6 +185,7 @@ func runRegistrationChurn(ctx context.Context, t *target, state *runState, optio
 	interval := time.Duration(float64(time.Second) / options.rate)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var held atomic.Int64
 	started := 0
 	for index := 1; index <= options.total; index++ {
 		if index > 1 {
@@ -188,7 +211,7 @@ func runRegistrationChurn(ctx context.Context, t *target, state *runState, optio
 		go func(i int) {
 			defer workers.Done()
 			defer func() { <-semaphore }()
-			if err := t.registerOne(ctx, state, i, options.dwell); err != nil {
+			if err := t.registerOne(ctx, state, i, options.dwell, &held); err != nil {
 				errorsFound <- err
 			}
 		}(index)

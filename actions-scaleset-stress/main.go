@@ -146,6 +146,14 @@ type runOptions struct {
 	runnerCPUs         float64
 	drainTimeout       time.Duration
 	artifactsDir       string
+	standingRunners    int
+	rampRate           float64
+	rampTimeout        time.Duration
+	hostGuard          bool
+	minFreeMemMiB      int64
+	minFreeDiskMiB     int64
+	maxLoadPerCPU      float64
+	workerReserveMiB   int64
 }
 
 func commandRun(args []string) error {
@@ -158,9 +166,17 @@ func commandRun(args []string) error {
 	fs.DurationVar(&o.duration, "duration", time.Minute, "hard maximum run duration")
 	fs.IntVar(&o.total, "total", 10, "maximum registrations or workflow dispatches")
 	fs.Float64Var(&o.rate, "rate", 1, "maximum new registrations or dispatches per second")
-	fs.IntVar(&o.maxInflight, "max-inflight", 5, "maximum concurrent registration operations")
+	fs.IntVar(&o.maxInflight, "max-inflight", 5, "maximum concurrent registration operations (registered runners held at once)")
 	fs.DurationVar(&o.dwell, "dwell", 5*time.Second, "registered runner dwell before removal")
 	fs.IntVar(&o.maxRunners, "max-runners", 4, "maximum concurrent official runner containers")
+	fs.IntVar(&o.standingRunners, "standing-runners", 0, "workflows mode: idle runner containers to ramp up to and keep online (0 = on demand only)")
+	fs.Float64Var(&o.rampRate, "ramp-rate", 5, "maximum runner containers started per second while growing the pool")
+	fs.DurationVar(&o.rampTimeout, "ramp-timeout", 15*time.Minute, "maximum time to wait for the standing pool before dispatching")
+	fs.BoolVar(&o.hostGuard, "host-guard", runtime.GOOS == "linux", "stop growing the runner pool when this host runs low on memory or disk (Linux only)")
+	fs.Int64Var(&o.minFreeMemMiB, "min-free-mem-mib", 2048, "host guard: memory that must remain available")
+	fs.Int64Var(&o.minFreeDiskMiB, "min-free-disk-mib", 10240, "host guard: disk space that must remain free under the artifacts directory")
+	fs.Float64Var(&o.maxLoadPerCPU, "max-load-per-cpu", 3, "host guard: pause growth while the 1-minute load average exceeds this per CPU")
+	fs.Int64Var(&o.workerReserveMiB, "worker-reserve-mib", 256, "host guard: memory reserved per busy runner for its job worker")
 	fs.IntVar(&o.jobsPerRun, "jobs-per-run", 1, "matrix jobs (synthetic) or test shards (ci) in each dispatched workflow")
 	fs.DurationVar(&o.jobDuration, "job-duration", time.Second, "bounded synthetic job or extra test-shard duration")
 	fs.IntVar(&o.failPercent, "fail-percent", 0, "percentage of dispatched workflow runs that intentionally fail one job; the rest pass")
@@ -249,7 +265,7 @@ func commandRun(args []string) error {
 	if heartbeatErr, ok := <-heartbeatDone; ok && heartbeatErr != nil {
 		workErr = errors.Join(workErr, heartbeatErr)
 	}
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	cleanupErr := cleanupRun(cleanupCtx, target, state)
 	cleanupCancel()
 	if err := state.update(func(data *runData) {
@@ -269,6 +285,7 @@ func commandRun(args []string) error {
 	if ctx.Err() != nil {
 		_ = state.record("run_stopped", map[string]any{"reason": ctx.Err().Error()})
 	}
+	printScaleSummary(os.Stdout, o.mode, state.snapshot().Scale)
 	if o.mode == "workflows" {
 		summary := state.snapshot()
 		fmt.Printf("Workflow runs (%s): %d dispatched, %d passed, %d failed intentionally as requested, %d failed verification, %d unresolved\n",
@@ -307,12 +324,26 @@ func (o runOptions) validate() error {
 		return errors.New("--total must be between 1 and 100000")
 	case o.rate <= 0 || o.rate > 100:
 		return errors.New("--rate must be > 0 and <= 100 operations per second")
-	case o.maxInflight <= 0 || o.maxInflight > 100:
-		return errors.New("--max-inflight must be between 1 and 100")
+	case o.maxInflight <= 0 || o.maxInflight > 1000:
+		return errors.New("--max-inflight must be between 1 and 1000")
 	case o.dwell < 0 || o.dwell > time.Hour:
 		return errors.New("--dwell must be between 0 and 1h")
-	case o.maxRunners <= 0 || o.maxRunners > 100:
-		return errors.New("--max-runners must be between 1 and 100")
+	case o.maxRunners <= 0 || o.maxRunners > 1000:
+		return errors.New("--max-runners must be between 1 and 1000")
+	case o.standingRunners < 0 || o.standingRunners > 1000:
+		return errors.New("--standing-runners must be between 0 and 1000")
+	case o.standingRunners > 0 && o.mode != "workflows":
+		return errors.New("--standing-runners applies only to --mode workflows")
+	case o.standingRunners > o.maxRunners:
+		return errors.New("--standing-runners cannot exceed --max-runners")
+	case o.rampRate <= 0 || o.rampRate > 50:
+		return errors.New("--ramp-rate must be > 0 and <= 50 runners per second")
+	case o.rampTimeout <= 0 || o.rampTimeout > 2*time.Hour:
+		return errors.New("--ramp-timeout must be between 1ns and 2h")
+	case o.minFreeMemMiB < 0 || o.minFreeDiskMiB < 0 || o.workerReserveMiB < 0:
+		return errors.New("host guard memory and disk limits cannot be negative")
+	case o.maxLoadPerCPU < 0:
+		return errors.New("--max-load-per-cpu cannot be negative")
 	case o.jobsPerRun <= 0 || o.jobsPerRun > 25:
 		return errors.New("--jobs-per-run must be between 1 and 25")
 	case o.jobDuration < 0 || o.jobDuration > 10*time.Minute:
@@ -371,7 +402,7 @@ func commandCleanup(args []string) error {
 	if !*apply {
 		return state.preview(os.Stdout)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	if err := cleanupRun(ctx, target, state); err != nil {
 		return err

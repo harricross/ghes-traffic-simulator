@@ -70,9 +70,32 @@ type runData struct {
 	IntentionalFailures int              `json:"intentional_failures"`
 	Failed              int              `json:"failed"`
 	Unresolved          int              `json:"unresolved"`
+	Scale               scaleResults     `json:"scale,omitzero"`
 	Status              string           `json:"status"`
 	CleanupStatus       string           `json:"cleanup_status"`
 	LastError           string           `json:"last_error,omitempty"`
+}
+
+// scaleResults records the highest runner counts a run reached and why
+// provisioning stopped growing. Registered counts are GHES-reported
+// (scale-set statistics); containers are runners this tool started.
+type scaleResults struct {
+	StandingTarget   int       `json:"standing_target,omitempty"`
+	PeakContainers   int       `json:"peak_containers,omitempty"`
+	PeakRegistered   int       `json:"peak_registered,omitempty"`
+	PeakIdle         int       `json:"peak_idle,omitempty"`
+	PeakBusy         int       `json:"peak_busy,omitempty"`
+	PeakAssignedJobs int       `json:"peak_assigned_jobs,omitempty"`
+	PeakRunningJobs  int       `json:"peak_running_jobs,omitempty"`
+	PeakHeld         int       `json:"peak_held_registrations,omitempty"`
+	HeldVerified     int       `json:"held_verified,omitempty"`
+	HeldMissing      int       `json:"held_missing,omitempty"`
+	ContainerExits   int       `json:"unexpected_container_exits,omitempty"`
+	ProvisionErrors  int       `json:"provision_errors,omitempty"`
+	CeilingRunners   int       `json:"ceiling_runners,omitempty"`
+	CeilingReason    string    `json:"ceiling_reason,omitempty"`
+	RampStartedAt    time.Time `json:"ramp_started_at,omitzero"`
+	RampFinishedAt   time.Time `json:"ramp_finished_at,omitzero"`
 }
 
 type runState struct {
@@ -324,4 +347,23 @@ func writeAtomic(name string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmpName, name)
+}
+
+func printScaleSummary(w io.Writer, mode string, scale scaleResults) {
+	if mode == "registrations" {
+		if scale.PeakHeld > 0 {
+			fmt.Fprintf(w, "Registrations held at once (registered-only, not online runners): peak %d; still registered at removal %d, missing %d\n",
+				scale.PeakHeld, scale.HeldVerified, scale.HeldMissing)
+		}
+		return
+	}
+	if scale.StandingTarget == 0 && scale.PeakContainers == 0 {
+		return
+	}
+	fmt.Fprintf(w, "Runners: standing target %d; peak containers %d; GHES-reported peak registered %d (idle %d, busy %d); peak assigned jobs %d, running jobs %d\n",
+		scale.StandingTarget, scale.PeakContainers, scale.PeakRegistered, scale.PeakIdle, scale.PeakBusy, scale.PeakAssignedJobs, scale.PeakRunningJobs)
+	if scale.CeilingReason != "" {
+		fmt.Fprintf(w, "Provisioning ceiling: %d runners (%s); unexpected container exits %d, provision errors %d\n",
+			scale.CeilingRunners, scale.CeilingReason, scale.ContainerExits, scale.ProvisionErrors)
+	}
 }

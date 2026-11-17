@@ -141,6 +141,46 @@ test shards per dispatch. The `--duration` deadline, operation rate, runner coun
 outstanding-job limit, container CPU/memory, work duration, log size, and
 drain timeout are independently bounded.
 
+### Scaling the runner count
+
+Two different numbers matter, and the tool reports them separately:
+
+- **Registered-only** runners: `--mode registrations` creates JIT runner
+  registrations and holds them for `--dwell` without starting any runner
+  process. `--max-inflight` (up to 1000) is the number held at once, and the
+  summary reports the peak plus how many were still registered when removed
+  (`held_verified`/`held_missing`). These are registrations, not online
+  runners, and need no host memory beyond the tool itself.
+- **Online** runners: in workflow mode every runner is a real container.
+  `--standing-runners N` ramps up to N idle runners at `--ramp-rate` per
+  second and keeps that many warm while dispatched jobs consume them
+  (ephemeral runners are replaced after each job). `--max-runners` (up to
+  1000) caps the total. Dispatching waits for the ramp up to `--ramp-timeout`.
+
+```bash
+./actions-scaleset-stress.sh run \
+  --config actions-scaleset-stress.json \
+  --mode workflows \
+  --duration 40m --total 100 --rate 0.5 --jobs-per-run 5 \
+  --standing-runners 150 --max-runners 200 --ramp-rate 2 \
+  --max-outstanding-jobs 100 --job-duration 30s \
+  --runner-memory-mib 768
+```
+
+Runners are limited by the Docker host, not by this tool. On Linux the host
+guard (`--host-guard`, default on) samples `/proc` before each start and
+stops growing the pool at a **ceiling** when available memory falls below
+`--min-free-mem-mib` plus `--worker-reserve-mib` for each runner that can be
+busy at once (`--max-outstanding-jobs`), or free disk under the artifacts
+directory falls below `--min-free-disk-mib`. High load
+(`--max-load-per-cpu`) only pauses growth. Three consecutive start failures
+or an unexpected non-zero runner container exit also lower the ceiling. The
+ceiling never rises during a run; it is recorded in `state.json`
+(`scale.ceiling_runners`, `scale.ceiling_reason`) and in the summary, along
+with the GHES-reported peak registered/idle/busy runners. A pool that cannot
+start any runner fails the run. Status lines print every 30 seconds. The
+guard protects the Docker host only; watch the appliance separately.
+
 The default run artifacts are written to
 `tmp/actions-scaleset-stress/<run-id>/` with restrictive permissions. The
 `state.json`, append-only journal, heartbeat, and final report contain
