@@ -371,7 +371,8 @@ ulimit -n 10000
   Hitting the 10,000 limit stops only that group. Real runners ramp to each
   group's `real` count while the fake fill runs. Once both finish, `--total`
   workflows are dispatched round-robin over groups with real runners at
-  `--dispatch-rate`, each pinned to that group's `-real` label, and every job
+  `--dispatch-rate`, each pinned to that group's `-real` label (or a
+  `fake_jobs` group's `-fake` label, see below), and every job
   is checked to have run in its group.
 - The fleet is then held until `--dwell` has passed and every workflow has
   finished, whichever is later. Per-group status is printed and journaled
@@ -387,6 +388,61 @@ ulimit -n 10000
   group: peaks for real, busy, fake idle and group runners; sessions opened
   and failed; fake runners registered against requested with any ceiling
   reason; and workflows passed, intentionally failed, failed and unresolved.
+
+#### Fake runners that run jobs (`fake_jobs`)
+
+Set `"fake_jobs": true` on a group to make its fake-online runners accept
+real workflow jobs without a container. GHES schedules, assigns and records
+the jobs as usual; each fake runner reports a canned result instead of
+executing steps.
+
+```json
+{"group_prefix": "stress", "groups": [
+  {"name": "mixed", "real": 1, "online": 300, "fake_jobs": true}
+]}
+```
+
+```bash
+./actions-scaleset-stress.sh run --config fleet-config.json --mode fleet --fleet fleet.json \
+  --workload ci --total 100 --jobs-per-run 2 --fail-percent 10 \
+  --fake-job-percent 95 --fake-job-duration 5s --rate 10 --dispatch-rate 1 \
+  --max-outstanding-jobs 200 --max-runners 1 --duration 40m
+```
+
+- A `fake_jobs` group needs `online` > 0. The run starts a scale-set
+  listener on the group's `-fake` scale set, which acquires every job offered
+  to it, and dispatches workflows pinned to that label as well as to the
+  `-real` labels.
+- `--fake-job-percent` (0–100, default 100) is the share of dispatches sent
+  to `fake_jobs` groups when the fleet also has real runners; it must be 100
+  when there are none. `--fake-job-duration` (0–10m, default 5s) is how long
+  each fake runner holds a job, renewing its lock, before completing it.
+- A fake job follows the runner's own sequence: it marks its timeline
+  record in progress, holds the job, closes its session, marks the record
+  completed with the result and sends `JobCompleted`. The result is
+  `failed` when the job's `matrix.shard` is in the workflow's
+  `failure_shards` input (as with `--fail-percent`), `canceled` if GHES
+  cancels it, and `succeeded` otherwise. Jobs therefore have conclusions
+  but no steps or logs, and `needs` gating behaves as with real runners.
+- Fake runners are ephemeral like real ones: GHES deletes each runner when
+  its job completes, and the run registers and opens a replacement (named
+  after the fill's indexes) unless the run is ending. Every run is still
+  verified to have run its jobs in its group with the expected conclusion.
+- The first fake-job error (an undecodable message, a rejected completion
+  or a failed replacement) stops dispatching and fails the run.
+- Only the legacy (non-broker) message protocol that GHES 3.20 selects is
+  supported. The session key is decrypted with RSA-OAEP SHA-256 when GHES
+  sets `useFipsEncryption`, otherwise SHA-1, as the runner does.
+
+#### Fleet measurements
+
+Measured on GHES 3.20.10 (8 CPU, 61 GB) from a 4-core/16 GB Codespace:
+
+- Registration ran at 15–25 runners/s (`--rate 25`) with no rate limiting.
+- About 3,000 concurrent fake-online sessions was comfortable for the
+  appliance; open them at `--open-concurrency 6`–10.
+- MSSQL (`/data/user/mssql`) grew by about 67–78 KB per registered runner.
+- `--max-runners` must be at least the total of the groups' `real` counts.
 
 ## Validation
 
