@@ -28,6 +28,7 @@ type groupAPI interface {
 	createRunnerGroup(ctx context.Context, org, name string, repoID int64) (*apiRunnerGroup, error)
 	getRunnerGroup(ctx context.Context, org string, id int64) (*apiRunnerGroup, error)
 	runnerGroupRunnerCount(ctx context.Context, org string, id int64) (int, error)
+	runnerGroupAllowsRepository(ctx context.Context, org string, group apiRunnerGroup, repoID int64) (bool, error)
 	deleteRunnerGroup(ctx context.Context, org string, id int64) error
 }
 
@@ -113,6 +114,33 @@ func (a *ghesAPI) deleteRunnerGroup(ctx context.Context, org string, id int64) e
 		return fmt.Errorf("delete runner group %d: %w", id, err)
 	}
 	return nil
+}
+
+// runnerGroupAllowsRepository reports whether workflows in the private
+// repository can use the group's runners.
+func (a *ghesAPI) runnerGroupAllowsRepository(ctx context.Context, org string, group apiRunnerGroup, repoID int64) (bool, error) {
+	if group.Visibility != "selected" {
+		return true, nil
+	}
+	for page := 1; page <= 100; page++ {
+		var listing struct {
+			TotalCount   int       `json:"total_count"`
+			Repositories []apiRepo `json:"repositories"`
+		}
+		route := fmt.Sprintf("%s/%d/repositories?per_page=%d&page=%d", runnerGroupsPath(org), group.ID, runnerGroupPageSize, page)
+		if _, err := a.request(ctx, http.MethodGet, route, nil, &listing, http.StatusOK); err != nil {
+			return false, fmt.Errorf("list repositories of runner group %d: %w", group.ID, err)
+		}
+		for _, repo := range listing.Repositories {
+			if repo.ID == repoID {
+				return true, nil
+			}
+		}
+		if len(listing.Repositories) < runnerGroupPageSize || page*runnerGroupPageSize >= listing.TotalCount {
+			return false, nil
+		}
+	}
+	return false, errors.New("list runner group repositories: more than 100 pages")
 }
 
 func (a *ghesAPI) repositoryID(ctx context.Context, owner, repo string) (int64, error) {

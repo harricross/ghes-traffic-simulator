@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -67,20 +68,35 @@ func (f *fakeScaleSets) DeleteRunnerScaleSet(_ context.Context, id int) error {
 type fakeGroups struct {
 	groups  map[int64]apiRunnerGroup
 	runners map[int64]int
+	repos   map[int64][]int64
+	nextID  int64
+	created []string
 	deleted []int64
 }
 
 func (f *fakeGroups) findRunnerGroup(_ context.Context, _, name string) (*apiRunnerGroup, error) {
 	for _, group := range f.groups {
-		if group.Name == name {
+		if strings.EqualFold(group.Name, name) {
 			return &group, nil
 		}
 	}
 	return nil, nil
 }
 
-func (f *fakeGroups) createRunnerGroup(context.Context, string, string, int64) (*apiRunnerGroup, error) {
-	return nil, fmt.Errorf("not implemented")
+func (f *fakeGroups) createRunnerGroup(_ context.Context, _, name string, repoID int64) (*apiRunnerGroup, error) {
+	f.nextID++
+	group := apiRunnerGroup{ID: f.nextID, Name: name, Visibility: "selected"}
+	f.groups[group.ID] = group
+	f.repos[group.ID] = []int64{repoID}
+	f.created = append(f.created, name)
+	return &group, nil
+}
+
+func (f *fakeGroups) runnerGroupAllowsRepository(_ context.Context, _ string, group apiRunnerGroup, repoID int64) (bool, error) {
+	if group.Visibility != "selected" {
+		return true, nil
+	}
+	return slices.Contains(f.repos[group.ID], repoID), nil
 }
 
 func (f *fakeGroups) getRunnerGroup(_ context.Context, _ string, id int64) (*apiRunnerGroup, error) {
@@ -123,6 +139,8 @@ func newFleetFixture(t *testing.T) (*runState, *fakeScaleSets, *fakeGroups) {
 	groups := &fakeGroups{
 		groups:  map[int64]apiRunnerGroup{11: {ID: 11, Name: "lab-a"}, 12: {ID: 12, Name: "shared"}},
 		runners: map[int64]int{},
+		repos:   map[int64][]int64{},
+		nextID:  100,
 	}
 	return state, sets, groups
 }
@@ -287,6 +305,8 @@ func TestRunnerGroupAPIPagesCreatesAndTreatsMissingAsGone(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 		case r.Method == http.MethodDelete && r.URL.Path == "/orgs/lab/actions/runner-groups/404":
 			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/orgs/lab/actions/runner-groups/501/repositories":
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "repositories": []apiRepo{{ID: 42}}})
 		default:
 			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusTeapot)
 		}
@@ -311,5 +331,13 @@ func TestRunnerGroupAPIPagesCreatesAndTreatsMissingAsGone(t *testing.T) {
 	}
 	if err := api.deleteRunnerGroup(ctx, "lab", 404); err != nil {
 		t.Fatalf("delete missing group: %v", err)
+	}
+	for repoID, want := range map[int64]bool{42: true, 43: false} {
+		if allowed, err := api.runnerGroupAllowsRepository(ctx, "lab", *group, repoID); err != nil || allowed != want {
+			t.Fatalf("repository %d allowed = %v, %v; want %v", repoID, allowed, err, want)
+		}
+	}
+	if allowed, err := api.runnerGroupAllowsRepository(ctx, "lab", apiRunnerGroup{ID: 1, Visibility: "all"}, 43); err != nil || !allowed {
+		t.Fatalf("visibility all: %v %v", allowed, err)
 	}
 }
