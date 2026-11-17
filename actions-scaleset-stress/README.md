@@ -443,6 +443,14 @@ Measured on GHES 3.20.10 (8 CPU, 61 GB) from a 4-core/16 GB Codespace:
   appliance; open them at `--open-concurrency 6`–10.
 - MSSQL (`/data/user/mssql`) grew by about 67–78 KB per registered runner.
 - `--max-runners` must be at least the total of the groups' `real` counts.
+- Workflow dispatch, not idle sessions, drives appliance load. With 600
+  fake-online `fake_jobs` runners holding sessions (load1 about 2–3), the CI
+  workload at `--dispatch-rate 1` pushed load1 to about 24 within 80 seconds.
+  At `--dispatch-rate 0.2` with `--max-outstanding-jobs 80`, 100 runs (370
+  fake jobs, 0 errors) peaked at load1 11 and averaged 6–9. Start at 0.2 or
+  lower and watch the appliance load.
+- That 100-run job workload grew MSSQL by about 400 MB, mostly the Pipelines
+  transaction log, whose space is reused only after a log backup.
 
 ## Validation
 
