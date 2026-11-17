@@ -246,6 +246,51 @@ These runners are registrations only; they never appear online and cannot run
 jobs. Watch the appliance separately, for example database size and load, while
 they are held.
 
+### Making runners appear online without containers (`probe-online`)
+
+`probe-online` is an experiment, not a workload mode. It registers JIT runners
+under a throwaway scale set (`probe-online-<MMDD-HHMMSS>`), then opens a
+runner session for each one using only the credentials inside its JIT config
+and long-polls for messages, so GHES reports the runners as `idle` instead of
+`registered-only`. No runner binary or container runs.
+
+```bash
+./actions-scaleset-stress.sh probe-online --config actions-scaleset-stress.json \
+  --runners 1000 --hold 10m --open-concurrency 10
+```
+
+- `--runners` (1–10000), `--hold` (10s–30m), `--open-concurrency` (1–50) and
+  `--runner-version` (default 2.338.0, the version reported in the session).
+  Raise `ulimit -n` above the runner count first (each session is one
+  connection).
+- It prints only non-secret metadata: the JIT file names, flow flags, redacted
+  URLs, scale-set statistics (`registered`/`idle`/`busy`) every 30s, and an
+  aggregate of session-open latency and poll results. Cleanup (always run,
+  including on SIGTERM) closes every session, removes every runner and deletes
+  the scale set.
+- It follows the protocol the JIT config selects. GHES 3.20.10 returned the
+  legacy (non-broker) flow: OAuth at `<server_url>_apis/oauth2/token`, then
+  `POST .../_apis/distributedtask/pools/<pool>/sessions` and a long poll on
+  `.../messages`. If `use_v2_flow` is true the session is created at the V2
+  server URL with `brokerSession`; this path is untested.
+- These runners cannot run jobs: the probe never accepts a message. Use
+  `--mode workflows` with real containers when jobs must execute.
+- The protocol is internal to the runner and can change between GHES versions.
+  Validate on the exact version under test. Token refresh on long holds (a 401
+  response triggers a new token) is implemented but has not been observed.
+
+Measured on GHES 3.20.10 (8 CPU, 61 GB) from a 4-core/16 GB Codespace:
+
+| Runners online | Idle as seen by GHES | Poll errors | Codespace memory | Appliance load1 |
+|---|---|---|---|---|
+| 100 | 100 | 0 | <1 GiB | ~3 |
+| 1000 | 1000 | 0 | ~1.8 GiB | ~4–5 |
+| 3000 | 3000 | 0 | ~1.7 GiB | ~4–7.5 while opening |
+
+For comparison, a real runner container used about 768 MiB each. The Actions
+data lives in MSSQL (`/data/user/mssql`), not MySQL; the MySQL size did not
+change measurably with 1000 runners.
+
 ## Validation
 
 From `actions-scaleset-stress/`:

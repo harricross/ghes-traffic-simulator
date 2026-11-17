@@ -105,6 +105,17 @@ type probeJIT struct {
 	files    []string
 }
 
+func redactedURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<unparseable>"
+	}
+	return u.Scheme + "://" + u.Host + "/<redacted-path>"
+}
+
 func jsonErrorShape(err error) string {
 	var typeErr *json.UnmarshalTypeError
 	var syntaxErr *json.SyntaxError
@@ -629,9 +640,10 @@ func commandProbeOnline(args []string) error {
 	fmt.Printf("jit files: %s\n", strings.Join(first.files, ", "))
 	fmt.Printf("jit settings: use_v2_flow=%t use_runner_admin_flow=%t ephemeral=%t hosted=%t pool_id=%d server_url=%s server_url_v2=%s\n",
 		first.settings.UseV2Flow, first.settings.UseRunnerAdminFlow, first.settings.Ephemeral, first.settings.IsHostedServer,
-		first.settings.PoolID, first.settings.ServerURL, first.settings.ServerURLV2)
+		first.settings.PoolID, redactedURL(first.settings.ServerURL), redactedURL(first.settings.ServerURLV2))
 	fmt.Printf("jit credentials: scheme=%s has_client_id=%t authorization_url=%s authorization_url_v2=%s oauth_endpoint_url=%s\n",
-		first.creds.Scheme, first.creds.Data.ClientID != "", first.creds.Data.AuthorizationURL, first.creds.Data.AuthorizationURLV2, first.creds.Data.OAuthEndpointURL)
+		first.creds.Scheme, first.creds.Data.ClientID != "", redactedURL(first.creds.Data.AuthorizationURL),
+		redactedURL(first.creds.Data.AuthorizationURLV2), redactedURL(first.creds.Data.OAuthEndpointURL))
 	stats("registered-only")
 
 	runCtx, stopRun := context.WithCancel(ctx)
