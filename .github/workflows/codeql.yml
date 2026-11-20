@@ -1,0 +1,54 @@
+name: CodeQL
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Monday at 07:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: manual
+          - language: python
+            build-mode: none
+          - language: actions
+            build-mode: none
+    env:
+      CODEQL_EXTRACTOR_GO_OPTION_EXTRACT_TESTS: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        if: matrix.language == 'go'
+        with:
+          go-version-file: actions-scaleset-stress/go.mod
+          cache: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      - name: Compile Go packages and tests without running them
+        if: matrix.language == 'go'
+        working-directory: actions-scaleset-stress
+        run: go test -c -o "$RUNNER_TEMP/" ./...
+
+      - name: Analyze and upload results
+        uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          category: "/language:${{ matrix.language }}"

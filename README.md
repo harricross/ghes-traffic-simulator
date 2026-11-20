@@ -267,3 +267,12 @@ Keep `.gh-api-examples.conf`, `tmp/sim-users.json`, and logs out of source
 control. Use disposable test accounts and tokens on non-production appliances.
 These scripts intentionally create users, repositories, forks, issues, pull
 requests, and commits.
+
+The [CodeQL workflow](.github/workflows/codeql.yml) is scheduled for Mondays at
+07:00 UTC on the default branch. To start a scan manually, select **Actions >
+CodeQL > Run workflow** on GitHub. Results appear under **Security > Code
+scanning**.
+
+The workflow uses CodeQL's `security-extended` queries for Go (including test
+files), Python, and GitHub Actions. CodeQL does not analyze standalone shell
+scripts, and the scan does not check out the private `test-data` corpus.
